@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>个人资料库</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Knowledge Vault</p>
+        <h1>个人资料库</h1>
+      </div>
+      <div class="session-pill" id="sessionStatus">未连接</div>
+    </header>
+
+    <main class="layout">
+      <section class="auth-panel" id="authPanel">
+        <div class="panel-heading">
+          <div>
+            <h2 id="authTitle">登录资料库</h2>
+            <p id="authSubtitle">进入后可以管理自己的资料。</p>
+          </div>
+        </div>
+
+        <div class="auth-switch" id="authSwitch" role="group" aria-label="选择登录或注册">
+          <button type="button" id="signinModeButton" aria-pressed="true">登录</button>
+          <button type="button" id="signupModeButton" aria-pressed="false">注册</button>
+        </div>
+
+        <form class="auth-form" id="authForm">
+          <label>
+            邮箱
+            <input id="emailInput" type="email" autocomplete="email" placeholder="you@example.com" required />
+          </label>
+          <label>
+            密码
+            <span class="field-control">
+              <input id="passwordInput" type="password" autocomplete="current-password" minlength="6" placeholder="至少 6 位" required />
+              <button type="button" class="field-button" id="passwordToggleButton">显示</button>
+            </span>
+          </label>
+          <p class="auth-message" id="authMessage" hidden></p>
+          <button type="submit" class="primary-button auth-submit" id="authSubmitButton">登录</button>
+        </form>
+
+        <div class="signed-in" id="signedInPanel" hidden>
+          <p id="userEmail"></p>
+          <button type="button" class="secondary-button" id="signoutButton">退出登录</button>
+        </div>
+
+        <div class="setup-warning" id="setupWarning" hidden>
+          <strong>还没连接 Supabase</strong>
+          <p>请先按 README 创建 Supabase 项目，并填写 <code>supabase-config.js</code>。</p>
+        </div>
+      </section>
+
+      <section class="workspace" id="workspace" hidden>
+        <section class="tools">
+          <label class="search-field">
+            搜索
+            <input id="searchInput" type="search" placeholder="输入标题、分类、内容或标签" />
+          </label>
+          <label>
+            分类
+            <select id="categoryFilter">
+              <option value="">全部分类</option>
+            </select>
+          </label>
+          <button type="button" class="primary-button" id="newItemButton">新增资料</button>
+        </section>
+
+        <section class="content-grid">
+          <div class="item-list" id="itemList"></div>
+
+          <aside class="detail-panel" id="detailPanel">
+            <div class="empty-state">
+              <h2>选择一条资料</h2>
+              <p>左侧会显示你保存的资料。点击卡片可以查看详情、编辑或删除。</p>
+            </div>
+          </aside>
+        </section>
+      </section>
+    </main>
+
+    <dialog class="item-dialog" id="itemDialog">
+      <form method="dialog" class="item-form" id="itemForm">
+        <div class="dialog-head">
+          <h2 id="dialogTitle">新增资料</h2>
+          <button type="button" class="icon-button" id="closeDialogButton" aria-label="关闭">×</button>
+        </div>
+
+        <input type="hidden" id="itemIdInput" />
+
+        <label>
+          标题
+          <input id="titleInput" type="text" maxlength="120" required />
+        </label>
+
+        <label>
+          分类
+          <input id="categoryInput" type="text" maxlength="40" placeholder="例如：学习、客户、产品" required />
+        </label>
+
+        <label>
+          标签
+          <input id="tagsInput" type="text" maxlength="160" placeholder="用逗号分隔，例如：前端, 入门, 资料" />
+        </label>
+
+        <label>
+          来源链接
+          <input id="sourceUrlInput" type="url" placeholder="https://example.com" />
+        </label>
+
+        <label>
+          内容
+          <textarea id="contentInput" rows="8" maxlength="5000" required></textarea>
+        </label>
+
+        <div class="button-row dialog-actions">
+          <button type="submit" class="primary-button">保存</button>
+          <button type="button" class="secondary-button" id="cancelButton">取消</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script src="./supabase-config.js?v=4"></script>
+    <script src="./app.js?v=4"></script>
+  </body>
+</html>
