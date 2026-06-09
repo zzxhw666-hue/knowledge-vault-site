@@ -24,10 +24,17 @@ import {
   ENERGY_REGEN_PER_SECOND,
   FIRE_COST,
   FIRE_DAMAGE,
+  MOVE_SPEED,
+  PROJECTILE_RADIUS,
+  createProjectile,
   clampAgent,
   createArenaAgent,
-  findShotTarget,
+  distance,
+  isProjectileExpired,
+  moveProjectile,
   isInCore,
+  resolveAgentCollision,
+  resolveProjectileCollision,
   respawnAgent,
 } from "./game/arena";
 import type { ArenaAgent, ArenaSignal, ArenaShot } from "./game/arena";
@@ -44,6 +51,14 @@ interface LogEntry {
   id: string;
   time: number;
   text: string;
+}
+
+interface ImpactEffect {
+  id: string;
+  x: number;
+  y: number;
+  type: "hit" | "bounce" | "spark";
+  time: number;
 }
 
 const STORAGE_NAME_KEY = "intel-clash:name";
@@ -214,6 +229,9 @@ function CharacterRoom({
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [pressedKeys, setPressedKeys] = useState<string[]>([]);
   const [shots, setShots] = useState<ArenaShot[]>([]);
+  const [impacts, setImpacts] = useState<ImpactEffect[]>([]);
+  const [damageFlash, setDamageFlash] = useState(false);
+  const [isShaking, setIsShaking] = useState(false);
   const [agent, setAgent] = useState(() => createArenaAgent(session.localPlayer, Date.now()));
   const [bot, setBot] = useState(() =>
     createArenaAgent(
@@ -237,28 +255,55 @@ function CharacterRoom({
     setLogs((entries) => [{ id: createClientId(), time: Date.now(), text }, ...entries].slice(0, 8));
   }, []);
 
+  const addImpact = useCallback((x: number, y: number, type: ImpactEffect["type"]) => {
+    setImpacts((items) => [...items.slice(-14), { id: createClientId(), x, y, type, time: Date.now() }]);
+  }, []);
+
+  const triggerDamageFeedback = useCallback(() => {
+    setDamageFlash(true);
+    setIsShaking(true);
+    window.setTimeout(() => setDamageFlash(false), 180);
+    window.setTimeout(() => setIsShaking(false), 180);
+  }, []);
+
+  const damageLocalAgent = useCallback(() => {
+    triggerDamageFeedback();
+    setAgent((previous) => {
+      const hp = Math.max(0, previous.hp - FIRE_DAMAGE);
+      addImpact(previous.x, previous.y, "hit");
+      if (hp <= 0) {
+        addLog("你被命中，已重新部署。");
+        return respawnAgent({ ...previous, hp }, Date.now(), 0);
+      }
+      addLog("你被脉冲命中。");
+      return { ...previous, hp, action: "hit", updatedAt: Date.now() };
+    });
+  }, [addImpact, addLog, triggerDamageFeedback]);
+
+  const damageTrainingTarget = useCallback(() => {
+    setBot((previous) => {
+      const hp = Math.max(0, previous.hp - FIRE_DAMAGE);
+      addImpact(previous.x, previous.y, "hit");
+      if (hp <= 0) {
+        addLog("训练靶机被击倒，正在重置。");
+        window.setTimeout(() => setBot(respawnAgent(previous, Date.now(), 1)), 900);
+        return { ...previous, hp, action: "down", updatedAt: Date.now() };
+      }
+      return { ...previous, hp, action: "hit", updatedAt: Date.now() };
+    });
+  }, [addImpact, addLog]);
+
   const handleSignal = useCallback(
     (signal: ArenaSignal) => {
       if (signal.type === "shot") {
-        setShots((items) => [...items.slice(-6), signal.shot]);
-        if (signal.shot.targetId === session.localPlayer.id) {
-          setAgent((previous) => {
-            const hp = Math.max(0, previous.hp - FIRE_DAMAGE);
-            if (hp <= 0) {
-              addLog("你被命中，已重新部署。");
-              return respawnAgent({ ...previous, hp }, Date.now(), 0);
-            }
-            addLog("你被脉冲命中。");
-            return { ...previous, hp, action: "fire", updatedAt: Date.now() };
-          });
-        }
+        setShots((items) => [...items.slice(-14), signal.shot]);
         return;
       }
       if (signal.type === "score" && signal.playerId !== session.localPlayer.id) {
         addLog("对手完成了一次核心上传。");
       }
     },
-    [addLog, session.localPlayer.id]
+    [addLog]
   );
 
   const { connectionStatus, errorMessage, presencePlayers, remoteAgents, sendSignal } = useArenaRoom({
@@ -350,10 +395,10 @@ function CharacterRoom({
           setCaptureProgress((progress) => Math.max(0, progress - elapsed * 18));
         }
 
-        const next = clampAgent({
+        const next = resolveAgentCollision({
           ...previous,
-          x: previous.x + (dx / length) * 28 * elapsed,
-          y: previous.y + (dy / length) * 28 * elapsed,
+          x: previous.x + (dx / length) * MOVE_SPEED * elapsed,
+          y: previous.y + (dy / length) * MOVE_SPEED * elapsed,
           angle,
           energy: Math.min(100, previous.energy + ENERGY_REGEN_PER_SECOND * elapsed),
           score,
@@ -369,13 +414,58 @@ function CharacterRoom({
         return next;
       });
 
-      setShots((items) => items.filter((shot) => Date.now() - shot.time < 180));
+      setShots((items) => {
+        const now = Date.now();
+        const targets = [agentRef.current, botRef.current, ...Object.values(remoteAgentsRef.current)];
+        const nextShots: ArenaShot[] = [];
+
+        for (const shot of items) {
+          if (isProjectileExpired(shot, now)) {
+            addImpact(shot.x, shot.y, "spark");
+            continue;
+          }
+
+          const movedShot = moveProjectile(shot, elapsed);
+          const collision = resolveProjectileCollision(movedShot);
+          const resolvedShot = collision.shot;
+
+          if (collision.bounced) {
+            addImpact(collision.impactX, collision.impactY, "bounce");
+          }
+          if (collision.expired) {
+            addImpact(collision.impactX, collision.impactY, "spark");
+            continue;
+          }
+
+          const target = targets.find((candidate) => {
+            if (candidate.hp <= 0) return false;
+            if (candidate.id === resolvedShot.shooterId && now - resolvedShot.time < 260) return false;
+            return distance(candidate, resolvedShot) <= AGENT_RADIUS + PROJECTILE_RADIUS + 0.7;
+          });
+
+          if (target) {
+            if (target.id === agentRef.current.id && resolvedShot.shooterId !== agentRef.current.id) {
+              damageLocalAgent();
+            } else if (target.id === botRef.current.id) {
+              damageTrainingTarget();
+            } else {
+              addImpact(target.x, target.y, "hit");
+            }
+            continue;
+          }
+
+          nextShots.push(resolvedShot);
+        }
+
+        return nextShots.slice(-16);
+      });
+      setImpacts((items) => items.filter((impact) => Date.now() - impact.time < 520));
       frame = requestAnimationFrame(step);
     };
 
     frame = requestAnimationFrame(step);
     return () => cancelAnimationFrame(frame);
-  }, [addLog, sendSignal]);
+  }, [addImpact, addLog, damageLocalAgent, damageTrainingTarget, sendSignal]);
 
   const onlineAgents = useMemo(() => {
     const remote = Object.values(remoteAgents).filter((remoteAgent) => Date.now() - remoteAgent.updatedAt < 5000);
@@ -400,18 +490,7 @@ function CharacterRoom({
   function fire() {
     const shooter = agentRef.current;
     if (shooter.energy < FIRE_COST || shooter.hp <= 0) return;
-    const remotes = Object.values(remoteAgentsRef.current);
-    const targets = [botRef.current, ...remotes].filter((target) => target.hp > 0);
-    const target = findShotTarget(shooter, targets);
-    const shot: ArenaShot = {
-      id: createClientId(),
-      shooterId: shooter.id,
-      targetId: target?.id ?? null,
-      x: shooter.x,
-      y: shooter.y,
-      angle: shooter.angle,
-      time: Date.now(),
-    };
+    const shot = createProjectile(shooter, createClientId(), Date.now());
 
     setAgent((previous) => ({
       ...previous,
@@ -419,29 +498,16 @@ function CharacterRoom({
       action: "fire",
       updatedAt: Date.now(),
     }));
-    setShots((items) => [...items.slice(-6), shot]);
+    setShots((items) => [...items.slice(-14), shot]);
     sendSignal({ type: "shot", shot });
-
-    if (target?.id === botRef.current.id) {
-      setBot((previous) => {
-        const hp = Math.max(0, previous.hp - FIRE_DAMAGE);
-        if (hp <= 0) {
-          addLog("训练靶机被击倒，正在重置。");
-          window.setTimeout(() => setBot(respawnAgent(previous, Date.now(), 1)), 900);
-        }
-        return { ...previous, hp, action: "down", updatedAt: Date.now() };
-      });
-      return;
-    }
-
-    addLog(target ? "脉冲命中目标。" : "脉冲发射。");
+    addLog("脉冲弹道发射。");
   }
 
   function dash() {
     const current = agentRef.current;
     if (current.energy < DASH_COST || current.hp <= 0) return;
     setAgent((previous) =>
-      clampAgent({
+      resolveAgentCollision({
         ...previous,
         x: previous.x + Math.cos(previous.angle) * DASH_DISTANCE,
         y: previous.y + Math.sin(previous.angle) * DASH_DISTANCE,
@@ -459,6 +525,7 @@ function CharacterRoom({
     setBot(createArenaAgent(bot, now, 1));
     setCaptureProgress(0);
     setShots([]);
+    setImpacts([]);
     addLog("本地测试状态已重置。");
   }
 
@@ -505,7 +572,7 @@ function CharacterRoom({
 
           <div
             ref={arenaRef}
-            className="character-arena"
+            className={`character-arena ${isShaking ? "shake" : ""}`}
             tabIndex={0}
             onPointerMove={updatePointer}
             onPointerDown={(event) => {
@@ -518,7 +585,7 @@ function CharacterRoom({
             {ARENA_ZONES.map((zone) => (
               <div
                 key={zone.id}
-                className={`arena-zone ${zone.kind}`}
+                className={`arena-zone ${zone.kind} ${zone.kind !== "core" ? "solid" : ""}`}
                 style={
                   {
                     "--x": `${zone.x}%`,
@@ -531,19 +598,44 @@ function CharacterRoom({
               </div>
             ))}
 
-            {shots.map((shot) => (
+            {shots.map((shot) => {
+              const trailLength = Math.max(2.4, Math.hypot(shot.x - shot.previousX, shot.y - shot.previousY));
+              return (
+                <div key={shot.id} className="projectile-layer">
+                  <div
+                    className="projectile-trail"
+                    style={
+                      {
+                        "--x": `${shot.previousX}%`,
+                        "--y": `${shot.previousY}%`,
+                        "--angle": `${Math.atan2(shot.y - shot.previousY, shot.x - shot.previousX)}rad`,
+                        "--length": `${trailLength}%`,
+                      } as CSSProperties
+                    }
+                  />
+                  <div
+                    className="projectile"
+                    style={
+                      {
+                        "--x": `${shot.x}%`,
+                        "--y": `${shot.y}%`,
+                        "--angle": `${shot.angle}rad`,
+                      } as CSSProperties
+                    }
+                  />
+                </div>
+              );
+            })}
+
+            {impacts.map((impact) => (
               <div
-                key={shot.id}
-                className="shot-beam"
-                style={
-                  {
-                    "--x": `${shot.x}%`,
-                    "--y": `${shot.y}%`,
-                    "--angle": `${shot.angle}rad`,
-                  } as CSSProperties
-                }
+                key={impact.id}
+                className={`impact-effect ${impact.type}`}
+                style={{ "--x": `${impact.x}%`, "--y": `${impact.y}%` } as CSSProperties}
               />
             ))}
+
+            {damageFlash ? <div className="damage-vignette" /> : null}
 
             {onlineAgents.map((arenaAgent) => (
               <AgentSprite key={arenaAgent.id} agent={arenaAgent} isLocal={arenaAgent.id === agent.id} />
@@ -648,7 +740,7 @@ function CharacterRoom({
 function AgentSprite({ agent, isLocal }: { agent: ArenaAgent; isLocal: boolean }) {
   return (
     <div
-      className={`agent-sprite ${isLocal ? "local" : ""} ${agent.hp <= 0 ? "down" : ""}`}
+      className={`agent-sprite ${isLocal ? "local" : ""} ${agent.action === "hit" ? "hit" : ""} ${agent.hp <= 0 ? "down" : ""}`}
       style={
         {
           "--x": `${agent.x}%`,

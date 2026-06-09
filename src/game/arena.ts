@@ -7,7 +7,7 @@ export interface ArenaAgent extends PresencePlayer {
   hp: number;
   energy: number;
   score: number;
-  action: "idle" | "move" | "fire" | "dash" | "capture" | "down";
+  action: "idle" | "move" | "fire" | "dash" | "capture" | "hit" | "down";
   updatedAt: number;
 }
 
@@ -15,9 +15,14 @@ export interface ArenaShot {
   id: string;
   shooterId: string;
   targetId: string | null;
+  previousX: number;
+  previousY: number;
   x: number;
   y: number;
   angle: number;
+  vx: number;
+  vy: number;
+  bouncesLeft: number;
   time: number;
 }
 
@@ -45,6 +50,10 @@ export const FIRE_COST = 12;
 export const FIRE_RANGE = 38;
 export const FIRE_ARC_DEGREES = 12;
 export const FIRE_DAMAGE = 28;
+export const PROJECTILE_SPEED = 76;
+export const PROJECTILE_RADIUS = 1.35;
+export const PROJECTILE_BOUNCES = 1;
+export const PROJECTILE_LIFETIME_MS = 2200;
 export const ENERGY_REGEN_PER_SECOND = 18;
 export const CAPTURE_RADIUS = 10;
 export const CAPTURE_SECONDS = 4.2;
@@ -84,6 +93,28 @@ export function clampAgent(agent: ArenaAgent): ArenaAgent {
   };
 }
 
+export function resolveAgentCollision(agent: ArenaAgent): ArenaAgent {
+  let next = clampAgent(agent);
+
+  for (const zone of getSolidZones()) {
+    const dx = next.x - zone.x;
+    const dy = next.y - zone.y;
+    const currentDistance = Math.hypot(dx, dy);
+    const minimumDistance = zone.radius + AGENT_RADIUS;
+    if (currentDistance >= minimumDistance) continue;
+
+    const nx = currentDistance > 0 ? dx / currentDistance : 1;
+    const ny = currentDistance > 0 ? dy / currentDistance : 0;
+    next = clampAgent({
+      ...next,
+      x: zone.x + nx * minimumDistance,
+      y: zone.y + ny * minimumDistance,
+    });
+  }
+
+  return next;
+}
+
 export function distance(a: Pick<ArenaAgent, "x" | "y">, b: Pick<ArenaAgent, "x" | "y">) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
@@ -108,6 +139,85 @@ export function findShotTarget(shooter: ArenaAgent, targets: ArenaAgent[]) {
   }
 
   return bestTarget;
+}
+
+export function createProjectile(shooter: ArenaAgent, id: string, now: number): ArenaShot {
+  const vx = Math.cos(shooter.angle) * PROJECTILE_SPEED;
+  const vy = Math.sin(shooter.angle) * PROJECTILE_SPEED;
+  const x = shooter.x + Math.cos(shooter.angle) * (AGENT_RADIUS + PROJECTILE_RADIUS + 0.8);
+  const y = shooter.y + Math.sin(shooter.angle) * (AGENT_RADIUS + PROJECTILE_RADIUS + 0.8);
+
+  return {
+    id,
+    shooterId: shooter.id,
+    targetId: null,
+    previousX: x,
+    previousY: y,
+    x,
+    y,
+    angle: shooter.angle,
+    vx,
+    vy,
+    bouncesLeft: PROJECTILE_BOUNCES,
+    time: now,
+  };
+}
+
+export function moveProjectile(shot: ArenaShot, elapsedSeconds: number): ArenaShot {
+  const x = shot.x + shot.vx * elapsedSeconds;
+  const y = shot.y + shot.vy * elapsedSeconds;
+
+  return {
+    ...shot,
+    previousX: shot.x,
+    previousY: shot.y,
+    x,
+    y,
+    angle: Math.atan2(shot.vy, shot.vx),
+  };
+}
+
+export interface ProjectileCollisionResult {
+  shot: ArenaShot;
+  bounced: boolean;
+  expired: boolean;
+  impactX: number;
+  impactY: number;
+}
+
+export function resolveProjectileCollision(shot: ArenaShot): ProjectileCollisionResult {
+  const boundaryCollision = getBoundaryCollision(shot);
+  if (boundaryCollision) {
+    return boundaryCollision;
+  }
+
+  for (const zone of getSolidZones()) {
+    const dx = shot.x - zone.x;
+    const dy = shot.y - zone.y;
+    const currentDistance = Math.hypot(dx, dy);
+    const minimumDistance = zone.radius + PROJECTILE_RADIUS;
+    if (currentDistance > minimumDistance) continue;
+
+    const nx = currentDistance > 0 ? dx / currentDistance : 1;
+    const ny = currentDistance > 0 ? dy / currentDistance : 0;
+    return bounceOrExpire(shot, nx, ny, zone.x + nx * minimumDistance, zone.y + ny * minimumDistance);
+  }
+
+  return {
+    shot,
+    bounced: false,
+    expired: false,
+    impactX: shot.x,
+    impactY: shot.y,
+  };
+}
+
+export function isProjectileExpired(shot: ArenaShot, now: number) {
+  return now - shot.time > PROJECTILE_LIFETIME_MS;
+}
+
+export function getSolidZones() {
+  return ARENA_ZONES.filter((zone) => zone.kind !== "core");
 }
 
 export function isInCore(agent: Pick<ArenaAgent, "x" | "y">) {
@@ -147,4 +257,58 @@ function shortestAngleDelta(a: number, b: number) {
 
 function degreesToRadians(value: number) {
   return (value * Math.PI) / 180;
+}
+
+function getBoundaryCollision(shot: ArenaShot): ProjectileCollisionResult | null {
+  if (shot.x <= PROJECTILE_RADIUS) {
+    return bounceOrExpire(shot, 1, 0, PROJECTILE_RADIUS, shot.y);
+  }
+  if (shot.x >= ARENA_WIDTH - PROJECTILE_RADIUS) {
+    return bounceOrExpire(shot, -1, 0, ARENA_WIDTH - PROJECTILE_RADIUS, shot.y);
+  }
+  if (shot.y <= PROJECTILE_RADIUS) {
+    return bounceOrExpire(shot, 0, 1, shot.x, PROJECTILE_RADIUS);
+  }
+  if (shot.y >= ARENA_HEIGHT - PROJECTILE_RADIUS) {
+    return bounceOrExpire(shot, 0, -1, shot.x, ARENA_HEIGHT - PROJECTILE_RADIUS);
+  }
+  return null;
+}
+
+function bounceOrExpire(shot: ArenaShot, nx: number, ny: number, impactX: number, impactY: number): ProjectileCollisionResult {
+  if (shot.bouncesLeft <= 0) {
+    return {
+      shot: {
+        ...shot,
+        x: impactX,
+        y: impactY,
+      },
+      bounced: false,
+      expired: true,
+      impactX,
+      impactY,
+    };
+  }
+
+  const dot = shot.vx * nx + shot.vy * ny;
+  const vx = shot.vx - 2 * dot * nx;
+  const vy = shot.vy - 2 * dot * ny;
+
+  return {
+    shot: {
+      ...shot,
+      previousX: impactX,
+      previousY: impactY,
+      x: impactX,
+      y: impactY,
+      vx,
+      vy,
+      angle: Math.atan2(vy, vx),
+      bouncesLeft: shot.bouncesLeft - 1,
+    },
+    bounced: true,
+    expired: false,
+    impactX,
+    impactY,
+  };
 }
