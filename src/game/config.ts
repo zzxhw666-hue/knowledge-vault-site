@@ -11,7 +11,105 @@ export const EVENT_DURATION_MS = 22_000;
 export const STARTING_RESOURCES = 18;
 export const MAX_SNAPSHOT_LOG = 9;
 
-export const PLAYER_COLORS = ["#50e6a4", "#f1b84b", "#f26d5b", "#8ca4ff"];
+export interface CharacterProfile {
+  id: string;
+  name: string;
+  color: string;
+  traitTitle: string;
+  traitDescription: string;
+  stats: {
+    moveSpeed: number;
+    dashDistance: number;
+    fireCost: number;
+    damage: number;
+    energyRegen: number;
+    projectileSpeed: number;
+    healing: number;
+    extraProjectiles: number;
+    maxHp: number;
+  };
+}
+
+export const CHARACTER_PROFILES: CharacterProfile[] = [
+  {
+    id: "mender",
+    name: "绿洲修复者",
+    color: "#50e6a4",
+    traitTitle: "自愈协议",
+    traitDescription: "核心回血更快，能量恢复略高。",
+    stats: {
+      moveSpeed: 1,
+      dashDistance: 1,
+      fireCost: 1,
+      damage: 0.95,
+      energyRegen: 1.1,
+      projectileSpeed: 1,
+      healing: 1.35,
+      extraProjectiles: 0,
+      maxHp: 100,
+    },
+  },
+  {
+    id: "breacher",
+    name: "金焰破门手",
+    color: "#f1b84b",
+    traitTitle: "重载脉冲",
+    traitDescription: "子弹伤害更高，但开火消耗略高。",
+    stats: {
+      moveSpeed: 0.96,
+      dashDistance: 0.95,
+      fireCost: 1.12,
+      damage: 1.22,
+      energyRegen: 1,
+      projectileSpeed: 0.94,
+      healing: 1,
+      extraProjectiles: 0,
+      maxHp: 100,
+    },
+  },
+  {
+    id: "runner",
+    name: "赤锋突袭者",
+    color: "#f26d5b",
+    traitTitle: "高速切入",
+    traitDescription: "移动和冲刺更快，适合抢道具和绕后。",
+    stats: {
+      moveSpeed: 1.14,
+      dashDistance: 1.18,
+      fireCost: 0.98,
+      damage: 1,
+      energyRegen: 0.96,
+      projectileSpeed: 1.04,
+      healing: 1,
+      extraProjectiles: 0,
+      maxHp: 100,
+    },
+  },
+  {
+    id: "prism",
+    name: "蓝棱折射师",
+    color: "#8ca4ff",
+    traitTitle: "折射枪口",
+    traitDescription: "开局额外发射 1 枚低伤害子弹。",
+    stats: {
+      moveSpeed: 0.98,
+      dashDistance: 1,
+      fireCost: 1.04,
+      damage: 0.82,
+      energyRegen: 1,
+      projectileSpeed: 1.08,
+      healing: 1,
+      extraProjectiles: 1,
+      maxHp: 100,
+    },
+  },
+];
+
+export const PLAYER_COLORS = CHARACTER_PROFILES.map((profile) => profile.color);
+
+export function getCharacterProfile(color: string): CharacterProfile {
+  return CHARACTER_PROFILES.find((profile) => profile.color === color) ?? CHARACTER_PROFILES[0];
+}
 
 export const CODENAMES = ["渡鸦", "棱镜", "夜航", "回声", "零点", "铁幕", "暗线", "白噪"];
 

@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  CORE_HEAL_PER_SECOND,
   createArenaAgent,
   createProjectile,
+  createUpgradeItem,
+  isUpgradeCollectible,
   resolveAgentCollision,
   resolveProjectileCollision,
   AGENT_RADIUS,
+  UPGRADE_RADIUS,
 } from "./arena";
 import type { PresencePlayer } from "./types";
 
@@ -45,5 +49,24 @@ describe("arena physics", () => {
     expect(result.expired).toBe(false);
     expect(result.shot.bouncesLeft).toBe(0);
     expect(result.shot.vy).toBeLessThan(0);
+  });
+
+  it("applies character damage traits to projectiles", () => {
+    const agent = createArenaAgent({ ...player, color: "#f1b84b" }, 1);
+    const shot = createProjectile(agent, "s2", 1);
+
+    expect(shot.damage).toBeGreaterThan(28);
+  });
+
+  it("collects upgrade items only inside pickup radius", () => {
+    const agent = createArenaAgent(player, 1);
+    const upgrade = createUpgradeItem("u1", 1, 0);
+
+    expect(isUpgradeCollectible({ ...agent, x: upgrade.x, y: upgrade.y + AGENT_RADIUS + UPGRADE_RADIUS - 0.1 }, upgrade)).toBe(true);
+    expect(isUpgradeCollectible({ ...agent, x: upgrade.x, y: upgrade.y + AGENT_RADIUS + UPGRADE_RADIUS + 1 }, upgrade)).toBe(false);
+  });
+
+  it("uses 20 hp per second as the core healing baseline", () => {
+    expect(CORE_HEAL_PER_SECOND).toBe(20);
   });
 });

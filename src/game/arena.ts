@@ -1,4 +1,5 @@
 import type { PresencePlayer } from "./types";
+import { getCharacterProfile } from "./config";
 
 export interface ArenaAgent extends PresencePlayer {
   x: number;
@@ -7,7 +8,7 @@ export interface ArenaAgent extends PresencePlayer {
   hp: number;
   energy: number;
   score: number;
-  action: "idle" | "move" | "fire" | "dash" | "capture" | "hit" | "down";
+  action: "idle" | "move" | "fire" | "dash" | "capture" | "hit" | "heal" | "down";
   updatedAt: number;
 }
 
@@ -22,14 +23,28 @@ export interface ArenaShot {
   angle: number;
   vx: number;
   vy: number;
+  damage: number;
   bouncesLeft: number;
   time: number;
+}
+
+export interface ArenaUpgrade {
+  id: string;
+  x: number;
+  y: number;
+  kind: "splitter";
+  label: string;
+  spawnedAt: number;
+  expiresAt: number;
 }
 
 export type ArenaSignal =
   | { type: "agent"; agent: ArenaAgent }
   | { type: "shot"; shot: ArenaShot }
-  | { type: "score"; playerId: string; score: number; time: number };
+  | { type: "score"; playerId: string; score: number; time: number }
+  | { type: "room-start"; startedBy: string; startedAt: number }
+  | { type: "upgrade-spawn"; upgrade: ArenaUpgrade }
+  | { type: "upgrade-collect"; upgradeId: string; playerId: string; time: number };
 
 export interface ArenaZone {
   id: string;
@@ -54,6 +69,12 @@ export const PROJECTILE_SPEED = 76;
 export const PROJECTILE_RADIUS = 1.35;
 export const PROJECTILE_BOUNCES = 1;
 export const PROJECTILE_LIFETIME_MS = 2200;
+export const CORE_HEAL_PER_SECOND = 20;
+export const UPGRADE_SPAWN_INTERVAL_MS = 10_000;
+export const UPGRADE_LIFETIME_MS = 18_000;
+export const UPGRADE_RADIUS = 2.6;
+export const MAX_WEAPON_UPGRADES = 4;
+export const MIN_ARENA_PLAYERS_TO_START = 2;
 export const ENERGY_REGEN_PER_SECOND = 18;
 export const CAPTURE_RADIUS = 10;
 export const CAPTURE_SECONDS = 4.2;
@@ -68,14 +89,28 @@ export const ARENA_ZONES: ArenaZone[] = [
   { id: "cover-b", label: "掩体", x: 70, y: 70, radius: 5, kind: "cover" },
 ];
 
+const UPGRADE_SPAWN_POINTS = [
+  { x: 38, y: 18 },
+  { x: 62, y: 18 },
+  { x: 84, y: 32 },
+  { x: 78, y: 68 },
+  { x: 62, y: 88 },
+  { x: 38, y: 88 },
+  { x: 16, y: 68 },
+  { x: 22, y: 32 },
+  { x: 42, y: 44 },
+  { x: 58, y: 56 },
+];
+
 export function createArenaAgent(player: PresencePlayer, now: number, offset = 0): ArenaAgent {
   const spawn = getSpawnPoint(offset);
+  const profile = getCharacterProfile(player.color);
   return {
     ...player,
     x: spawn.x,
     y: spawn.y,
     angle: 0,
-    hp: 100,
+    hp: profile.stats.maxHp,
     energy: 100,
     score: 0,
     action: "idle",
@@ -84,11 +119,12 @@ export function createArenaAgent(player: PresencePlayer, now: number, offset = 0
 }
 
 export function clampAgent(agent: ArenaAgent): ArenaAgent {
+  const profile = getCharacterProfile(agent.color);
   return {
     ...agent,
     x: clamp(agent.x, AGENT_RADIUS, ARENA_WIDTH - AGENT_RADIUS),
     y: clamp(agent.y, AGENT_RADIUS, ARENA_HEIGHT - AGENT_RADIUS),
-    hp: clamp(agent.hp, 0, 100),
+    hp: clamp(agent.hp, 0, profile.stats.maxHp),
     energy: clamp(agent.energy, 0, 100),
   };
 }
@@ -141,11 +177,24 @@ export function findShotTarget(shooter: ArenaAgent, targets: ArenaAgent[]) {
   return bestTarget;
 }
 
-export function createProjectile(shooter: ArenaAgent, id: string, now: number): ArenaShot {
-  const vx = Math.cos(shooter.angle) * PROJECTILE_SPEED;
-  const vy = Math.sin(shooter.angle) * PROJECTILE_SPEED;
-  const x = shooter.x + Math.cos(shooter.angle) * (AGENT_RADIUS + PROJECTILE_RADIUS + 0.8);
-  const y = shooter.y + Math.sin(shooter.angle) * (AGENT_RADIUS + PROJECTILE_RADIUS + 0.8);
+export function createProjectile(
+  shooter: ArenaAgent,
+  id: string,
+  now: number,
+  options: {
+    angleOffset?: number;
+    speedMultiplier?: number;
+    damageMultiplier?: number;
+  } = {}
+): ArenaShot {
+  const profile = getCharacterProfile(shooter.color);
+  const angle = shooter.angle + (options.angleOffset ?? 0);
+  const speed = PROJECTILE_SPEED * profile.stats.projectileSpeed * (options.speedMultiplier ?? 1);
+  const damage = FIRE_DAMAGE * profile.stats.damage * (options.damageMultiplier ?? 1);
+  const vx = Math.cos(angle) * speed;
+  const vy = Math.sin(angle) * speed;
+  const x = shooter.x + Math.cos(angle) * (AGENT_RADIUS + PROJECTILE_RADIUS + 0.8);
+  const y = shooter.y + Math.sin(angle) * (AGENT_RADIUS + PROJECTILE_RADIUS + 0.8);
 
   return {
     id,
@@ -155,9 +204,10 @@ export function createProjectile(shooter: ArenaAgent, id: string, now: number): 
     previousY: y,
     x,
     y,
-    angle: shooter.angle,
+    angle,
     vx,
     vy,
+    damage,
     bouncesLeft: PROJECTILE_BOUNCES,
     time: now,
   };
@@ -224,13 +274,31 @@ export function isInCore(agent: Pick<ArenaAgent, "x" | "y">) {
   return distance(agent, ARENA_ZONES[0]) <= CAPTURE_RADIUS;
 }
 
+export function createUpgradeItem(id: string, now: number, sequence: number): ArenaUpgrade {
+  const point = UPGRADE_SPAWN_POINTS[Math.abs(sequence) % UPGRADE_SPAWN_POINTS.length];
+  return {
+    id,
+    x: point.x,
+    y: point.y,
+    kind: "splitter",
+    label: "+1 弹道",
+    spawnedAt: now,
+    expiresAt: now + UPGRADE_LIFETIME_MS,
+  };
+}
+
+export function isUpgradeCollectible(agent: Pick<ArenaAgent, "x" | "y">, upgrade: ArenaUpgrade) {
+  return distance(agent, upgrade) <= AGENT_RADIUS + UPGRADE_RADIUS;
+}
+
 export function respawnAgent(agent: ArenaAgent, now: number, offset = 0): ArenaAgent {
   const spawn = getSpawnPoint(offset);
+  const profile = getCharacterProfile(agent.color);
   return {
     ...agent,
     x: spawn.x,
     y: spawn.y,
-    hp: 100,
+    hp: profile.stats.maxHp,
     energy: 72,
     action: "idle",
     updatedAt: now,

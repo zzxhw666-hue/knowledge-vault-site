@@ -19,17 +19,22 @@ import {
   AGENT_RADIUS,
   ARENA_ZONES,
   CAPTURE_SECONDS,
+  CORE_HEAL_PER_SECOND,
   DASH_COST,
   DASH_DISTANCE,
   ENERGY_REGEN_PER_SECOND,
   FIRE_COST,
-  FIRE_DAMAGE,
+  MAX_WEAPON_UPGRADES,
+  MIN_ARENA_PLAYERS_TO_START,
   MOVE_SPEED,
   PROJECTILE_RADIUS,
+  UPGRADE_RADIUS,
+  UPGRADE_SPAWN_INTERVAL_MS,
   createProjectile,
-  clampAgent,
   createArenaAgent,
+  createUpgradeItem,
   distance,
+  isUpgradeCollectible,
   isProjectileExpired,
   moveProjectile,
   isInCore,
@@ -37,8 +42,8 @@ import {
   resolveProjectileCollision,
   respawnAgent,
 } from "./game/arena";
-import type { ArenaAgent, ArenaSignal, ArenaShot } from "./game/arena";
-import { CODENAMES, PLAYER_COLORS } from "./game/config";
+import type { ArenaAgent, ArenaSignal, ArenaShot, ArenaUpgrade } from "./game/arena";
+import { CHARACTER_PROFILES, CODENAMES, PLAYER_COLORS, getCharacterProfile } from "./game/config";
 import type { PresencePlayer } from "./game/types";
 import { useArenaRoom } from "./hooks/useArenaRoom";
 
@@ -57,14 +62,33 @@ interface ImpactEffect {
   id: string;
   x: number;
   y: number;
-  type: "hit" | "bounce" | "spark";
+  type: "hit" | "bounce" | "spark" | "heal" | "upgrade";
   time: number;
+}
+
+interface DashTrail {
+  id: string;
+  previousX: number;
+  previousY: number;
+  x: number;
+  y: number;
+  color: string;
+  time: number;
+}
+
+interface DashState {
+  startedAt: number;
+  endsAt: number;
+  directionX: number;
+  directionY: number;
+  distance: number;
 }
 
 const STORAGE_NAME_KEY = "intel-clash:name";
 const STORAGE_COLOR_KEY = "intel-clash:color";
 const STORAGE_CODENAME_KEY = "intel-clash:codename";
 const SHOW_LOCAL_TEST_TOOLS = import.meta.env.DEV;
+const DASH_DURATION_MS = 220;
 
 export function App() {
   const initialRoom = getRoomFromHash();
@@ -74,6 +98,8 @@ export function App() {
   const [codenameIndex, setCodenameIndex] = useState(() => Number(localStorage.getItem(STORAGE_CODENAME_KEY) ?? 0) || 0);
   const [session, setSession] = useState<RoomSession | null>(null);
   const [toast, setToast] = useState("");
+  const selectedCharacterIndex = normalizeIndex(colorIndex, CHARACTER_PROFILES.length);
+  const selectedCharacter = CHARACTER_PROFILES[selectedCharacterIndex];
 
   useEffect(() => {
     if (!toast) return;
@@ -96,7 +122,7 @@ export function App() {
       localPlayer: {
         id: createClientId(),
         name: playerName,
-        color: PLAYER_COLORS[colorIndex % PLAYER_COLORS.length],
+        color: PLAYER_COLORS[selectedCharacterIndex],
         codename,
         joinedAt: Date.now(),
       },
@@ -145,19 +171,24 @@ export function App() {
             </label>
 
             <div className="field-group">
-              <span>角色颜色</span>
-              <div className="swatch-row">
-                {PLAYER_COLORS.map((color, index) => (
+              <span>角色 / 特性</span>
+              <div className="character-choice-grid">
+                {CHARACTER_PROFILES.map((profile, index) => (
                   <button
-                    key={color}
+                    key={profile.id}
                     type="button"
-                    className={index === colorIndex ? "swatch selected" : "swatch"}
-                    style={{ "--swatch": color } as CSSProperties}
-                    aria-label={`选择颜色 ${index + 1}`}
+                    className={index === selectedCharacterIndex ? "character-choice selected" : "character-choice"}
+                    style={{ "--swatch": profile.color } as CSSProperties}
+                    aria-label={`选择角色 ${profile.name}`}
                     onClick={() => setColorIndex(index)}
-                  />
+                  >
+                    <i />
+                    <strong>{profile.name}</strong>
+                    <span>{profile.traitTitle}</span>
+                  </button>
                 ))}
               </div>
+              <p className="trait-note">{selectedCharacter.traitDescription}</p>
             </div>
 
             <label>
@@ -226,11 +257,26 @@ function CharacterRoom({
   const keysRef = useRef(new Set<string>());
   const pointerRef = useRef({ x: 50, y: 50 });
   const lastBroadcastRef = useRef(0);
+  const lastHealEffectRef = useRef(0);
+  const lastEnergyWarningRef = useRef(0);
+  const lastDashTrailRef = useRef(0);
+  const lastUpgradeSpawnAtRef = useRef(0);
+  const upgradeSequenceRef = useRef(0);
+  const collectedUpgradeIdsRef = useRef(new Set<string>());
+  const dashStateRef = useRef<DashState | null>(null);
+  const roomStartedRef = useRef(false);
+  const weaponLevelRef = useRef(0);
   const [captureProgress, setCaptureProgress] = useState(0);
+  const [roomStarted, setRoomStarted] = useState(false);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [pressedKeys, setPressedKeys] = useState<string[]>([]);
   const [shots, setShots] = useState<ArenaShot[]>([]);
   const [impacts, setImpacts] = useState<ImpactEffect[]>([]);
+  const [dashTrails, setDashTrails] = useState<DashTrail[]>([]);
+  const [upgrades, setUpgrades] = useState<ArenaUpgrade[]>([]);
+  const [weaponLevel, setWeaponLevel] = useState(0);
+  const [hitFlashUntil, setHitFlashUntil] = useState<Record<string, number>>({});
   const [damageFlash, setDamageFlash] = useState(false);
   const [isShaking, setIsShaking] = useState(false);
   const [agent, setAgent] = useState(() => createArenaAgent(session.localPlayer, Date.now()));
@@ -239,6 +285,7 @@ function CharacterRoom({
   const agentRef = useRef(agent);
   const botRef = useRef(bot);
   const remoteAgentsRef = useRef<Record<string, ArenaAgent>>({});
+  const upgradesRef = useRef<ArenaUpgrade[]>([]);
 
   const addLog = useCallback((text: string) => {
     setLogs((entries) => [{ id: createClientId(), time: Date.now(), text }, ...entries].slice(0, 8));
@@ -248,6 +295,24 @@ function CharacterRoom({
     setImpacts((items) => [...items.slice(-14), { id: createClientId(), x, y, type, time: Date.now() }]);
   }, []);
 
+  const addDashTrail = useCallback((previousX: number, previousY: number, x: number, y: number, color: string) => {
+    setDashTrails((items) => [
+      ...items.slice(-16),
+      { id: createClientId(), previousX, previousY, x, y, color, time: Date.now() },
+    ]);
+  }, []);
+
+  const flashAgent = useCallback((agentId: string) => {
+    setHitFlashUntil((items) => ({ ...items, [agentId]: Date.now() + 520 }));
+  }, []);
+
+  const warnEnergy = useCallback(() => {
+    const now = Date.now();
+    if (now - lastEnergyWarningRef.current < 850) return;
+    lastEnergyWarningRef.current = now;
+    addLog("能量不足，等待恢复。");
+  }, [addLog]);
+
   const triggerDamageFeedback = useCallback(() => {
     setDamageFlash(true);
     setIsShaking(true);
@@ -255,10 +320,11 @@ function CharacterRoom({
     window.setTimeout(() => setIsShaking(false), 180);
   }, []);
 
-  const damageLocalAgent = useCallback(() => {
+  const damageLocalAgent = useCallback((damage: number) => {
     triggerDamageFeedback();
     setAgent((previous) => {
-      const hp = Math.max(0, previous.hp - FIRE_DAMAGE);
+      flashAgent(previous.id);
+      const hp = Math.max(0, previous.hp - damage);
       addImpact(previous.x, previous.y, "hit");
       if (hp <= 0) {
         addLog("你被命中，已重新部署。");
@@ -267,13 +333,14 @@ function CharacterRoom({
       addLog("你被脉冲命中。");
       return { ...previous, hp, action: "hit", updatedAt: Date.now() };
     });
-  }, [addImpact, addLog, triggerDamageFeedback]);
+  }, [addImpact, addLog, flashAgent, triggerDamageFeedback]);
 
-  const damageTrainingTarget = useCallback(() => {
+  const damageTrainingTarget = useCallback((damage: number) => {
     if (!SHOW_LOCAL_TEST_TOOLS) return;
     setBot((previous) => {
       if (!previous) return previous;
-      const hp = Math.max(0, previous.hp - FIRE_DAMAGE);
+      flashAgent(previous.id);
+      const hp = Math.max(0, previous.hp - damage);
       addImpact(previous.x, previous.y, "hit");
       if (hp <= 0) {
         addLog("训练靶机被击倒，正在重置。");
@@ -282,19 +349,44 @@ function CharacterRoom({
       }
       return { ...previous, hp, action: "hit", updatedAt: Date.now() };
     });
-  }, [addImpact, addLog]);
+  }, [addImpact, addLog, flashAgent]);
 
   const handleSignal = useCallback(
     (signal: ArenaSignal) => {
+      if (signal.type === "room-start") {
+        const wasStarted = roomStartedRef.current;
+        setRoomStarted(true);
+        setStartedAt(signal.startedAt);
+        roomStartedRef.current = true;
+        lastUpgradeSpawnAtRef.current = signal.startedAt;
+        if (!wasStarted) {
+          addLog("房主已开始行动。");
+        }
+        return;
+      }
       if (signal.type === "shot") {
         setShots((items) => [...items.slice(-14), signal.shot]);
+        return;
+      }
+      if (signal.type === "upgrade-spawn") {
+        setUpgrades((items) => {
+          if (items.some((item) => item.id === signal.upgrade.id)) return items;
+          return [...items, signal.upgrade].slice(-4);
+        });
+        return;
+      }
+      if (signal.type === "upgrade-collect") {
+        setUpgrades((items) => items.filter((item) => item.id !== signal.upgradeId));
+        if (signal.playerId !== session.localPlayer.id) {
+          addLog("对手获取了弹道升级。");
+        }
         return;
       }
       if (signal.type === "score" && signal.playerId !== session.localPlayer.id) {
         addLog("对手完成了一次核心上传。");
       }
     },
-    [addLog]
+    [addLog, session.localPlayer.id]
   );
 
   const { connectionStatus, errorMessage, presencePlayers, remoteAgents, sendSignal } = useArenaRoom({
@@ -302,6 +394,12 @@ function CharacterRoom({
     localPlayer: session.localPlayer,
     onSignal: handleSignal,
   });
+  const hostId = presencePlayers[0]?.id ?? session.localPlayer.id;
+  const isHost = hostId === session.localPlayer.id;
+  const canStartRoom = presencePlayers.length >= MIN_ARENA_PLAYERS_TO_START || SHOW_LOCAL_TEST_TOOLS;
+  const localProfile = getCharacterProfile(session.localPlayer.color);
+  const fireEnergyCost = FIRE_COST * localProfile.stats.fireCost;
+  const dashEnergyCost = DASH_COST;
 
   useEffect(() => {
     agentRef.current = agent;
@@ -314,6 +412,50 @@ function CharacterRoom({
   useEffect(() => {
     remoteAgentsRef.current = remoteAgents;
   }, [remoteAgents]);
+
+  useEffect(() => {
+    upgradesRef.current = upgrades;
+  }, [upgrades]);
+
+  useEffect(() => {
+    weaponLevelRef.current = weaponLevel;
+  }, [weaponLevel]);
+
+  useEffect(() => {
+    roomStartedRef.current = roomStarted;
+  }, [roomStarted]);
+
+  useEffect(() => {
+    if (!isHost || !roomStarted || !startedAt) return;
+    sendSignal({ type: "room-start", startedBy: session.localPlayer.id, startedAt });
+    for (const upgrade of upgradesRef.current) {
+      sendSignal({ type: "upgrade-spawn", upgrade });
+    }
+  }, [isHost, presencePlayers.length, roomStarted, sendSignal, session.localPlayer.id, startedAt]);
+
+  const spawnUpgrade = useCallback(
+    (now: number) => {
+      const upgrade = createUpgradeItem(`upgrade-${now}-${upgradeSequenceRef.current}`, now, upgradeSequenceRef.current);
+      upgradeSequenceRef.current += 1;
+      setUpgrades((items) => [...items.filter((item) => item.expiresAt > now), upgrade].slice(-4));
+      sendSignal({ type: "upgrade-spawn", upgrade });
+      addLog("地图生成了弹道升级。");
+    },
+    [addLog, sendSignal]
+  );
+
+  const collectUpgrade = useCallback(
+    (upgrade: ArenaUpgrade) => {
+      if (collectedUpgradeIdsRef.current.has(upgrade.id)) return;
+      collectedUpgradeIdsRef.current.add(upgrade.id);
+      setUpgrades((items) => items.filter((item) => item.id !== upgrade.id));
+      setWeaponLevel((level) => Math.min(MAX_WEAPON_UPGRADES, level + 1));
+      addImpact(upgrade.x, upgrade.y, "upgrade");
+      addLog("弹道升级获取：每次射击 +1 枚子弹。");
+      sendSignal({ type: "upgrade-collect", upgradeId: upgrade.id, playerId: session.localPlayer.id, time: Date.now() });
+    },
+    [addImpact, addLog, sendSignal, session.localPlayer.id]
+  );
 
   useEffect(() => {
     arenaRef.current?.focus();
@@ -345,31 +487,70 @@ function CharacterRoom({
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, []);
+  }, [dash, fire]);
 
   useEffect(() => {
+    if (!roomStarted) return;
     let frame = 0;
     let lastTime = performance.now();
 
     const step = (time: number) => {
       const elapsed = Math.min(0.05, Math.max(0, (time - lastTime) / 1000));
       lastTime = time;
+      const now = Date.now();
       const keys = keysRef.current;
 
-      setAgent((previous) => {
-        let dx = 0;
-        let dy = 0;
-        if (keys.has("w") || keys.has("arrowup")) dy -= 1;
-        if (keys.has("s") || keys.has("arrowdown")) dy += 1;
-        if (keys.has("a") || keys.has("arrowleft")) dx -= 1;
-        if (keys.has("d") || keys.has("arrowright")) dx += 1;
+      if (isHost && now - lastUpgradeSpawnAtRef.current >= UPGRADE_SPAWN_INTERVAL_MS) {
+        lastUpgradeSpawnAtRef.current = now;
+        spawnUpgrade(now);
+      }
 
-        const length = Math.hypot(dx, dy) || 1;
+      setAgent((previous) => {
+        const profile = getCharacterProfile(previous.color);
         const pointer = pointerRef.current;
         const angle = Math.atan2(pointer.y - previous.y, pointer.x - previous.x);
-        const isMoving = dx !== 0 || dy !== 0;
-        const isCapturing = keys.has("e") && isInCore(previous);
+        const activeDash = dashStateRef.current && now < dashStateRef.current.endsAt ? dashStateRef.current : null;
+        if (dashStateRef.current && now >= dashStateRef.current.endsAt) {
+          dashStateRef.current = null;
+        }
+
+        let moveX = 0;
+        let moveY = 0;
+        let isMoving = false;
+
+        if (activeDash) {
+          const dashStep = (activeDash.distance / (DASH_DURATION_MS / 1000)) * elapsed;
+          moveX = activeDash.directionX * dashStep;
+          moveY = activeDash.directionY * dashStep;
+          isMoving = true;
+        } else {
+          let dx = 0;
+          let dy = 0;
+          if (keys.has("w") || keys.has("arrowup")) dy -= 1;
+          if (keys.has("s") || keys.has("arrowdown")) dy += 1;
+          if (keys.has("a") || keys.has("arrowleft")) dx -= 1;
+          if (keys.has("d") || keys.has("arrowright")) dx += 1;
+
+          const length = Math.hypot(dx, dy) || 1;
+          isMoving = dx !== 0 || dy !== 0;
+          moveX = (dx / length) * MOVE_SPEED * profile.stats.moveSpeed * elapsed;
+          moveY = (dy / length) * MOVE_SPEED * profile.stats.moveSpeed * elapsed;
+        }
+
         let score = previous.score;
+
+        const baseNext = resolveAgentCollision({
+          ...previous,
+          x: previous.x + moveX,
+          y: previous.y + moveY,
+          angle,
+          energy: Math.min(100, previous.energy + ENERGY_REGEN_PER_SECOND * profile.stats.energyRegen * elapsed),
+          score,
+          action: activeDash ? "dash" : isMoving ? "move" : "idle",
+          updatedAt: now,
+        });
+        const isCapturing = keys.has("e") && isInCore(baseNext);
+        const isHealing = isInCore(baseNext) && baseNext.hp < profile.stats.maxHp;
 
         if (isCapturing) {
           setCaptureProgress((progress) => {
@@ -377,7 +558,7 @@ function CharacterRoom({
             if (next >= 100 && progress < 100) {
               score += 1;
               addLog("核心上传完成，得分 +1。");
-              sendSignal({ type: "score", playerId: previous.id, score, time: Date.now() });
+              sendSignal({ type: "score", playerId: previous.id, score, time: now });
               return 0;
             }
             return next;
@@ -386,16 +567,25 @@ function CharacterRoom({
           setCaptureProgress((progress) => Math.max(0, progress - elapsed * 18));
         }
 
-        const next = resolveAgentCollision({
-          ...previous,
-          x: previous.x + (dx / length) * MOVE_SPEED * elapsed,
-          y: previous.y + (dy / length) * MOVE_SPEED * elapsed,
-          angle,
-          energy: Math.min(100, previous.energy + ENERGY_REGEN_PER_SECOND * elapsed),
+        const healedHp = isHealing
+          ? Math.min(profile.stats.maxHp, baseNext.hp + CORE_HEAL_PER_SECOND * profile.stats.healing * elapsed)
+          : baseNext.hp;
+        const next = {
+          ...baseNext,
+          hp: healedHp,
           score,
-          action: isCapturing ? "capture" : isMoving ? "move" : "idle",
-          updatedAt: Date.now(),
-        });
+          action: isCapturing ? "capture" : isHealing ? "heal" : baseNext.action,
+        };
+
+        if (isHealing && now - lastHealEffectRef.current > 360) {
+          lastHealEffectRef.current = now;
+          addImpact(next.x, next.y, "heal");
+        }
+
+        if (activeDash && now - lastDashTrailRef.current > 24) {
+          lastDashTrailRef.current = now;
+          addDashTrail(previous.x, previous.y, next.x, next.y, previous.color);
+        }
 
         if (time - lastBroadcastRef.current > 80) {
           lastBroadcastRef.current = time;
@@ -406,7 +596,6 @@ function CharacterRoom({
       });
 
       setShots((items) => {
-        const now = Date.now();
         const trainingTargets = SHOW_LOCAL_TEST_TOOLS && botRef.current ? [botRef.current] : [];
         const targets = [agentRef.current, ...trainingTargets, ...Object.values(remoteAgentsRef.current)];
         const nextShots: ArenaShot[] = [];
@@ -436,10 +625,11 @@ function CharacterRoom({
           });
 
           if (target) {
+            flashAgent(target.id);
             if (target.id === agentRef.current.id && resolvedShot.shooterId !== agentRef.current.id) {
-              damageLocalAgent();
+              damageLocalAgent(resolvedShot.damage);
             } else if (SHOW_LOCAL_TEST_TOOLS && target.id === botRef.current?.id) {
-              damageTrainingTarget();
+              damageTrainingTarget(resolvedShot.damage);
             } else {
               addImpact(target.x, target.y, "hit");
             }
@@ -451,13 +641,37 @@ function CharacterRoom({
 
         return nextShots.slice(-16);
       });
-      setImpacts((items) => items.filter((impact) => Date.now() - impact.time < 520));
+
+      const pickup = upgradesRef.current.find((upgrade) => upgrade.expiresAt > now && isUpgradeCollectible(agentRef.current, upgrade));
+      if (pickup) {
+        collectUpgrade(pickup);
+      }
+
+      setUpgrades((items) => items.filter((upgrade) => upgrade.expiresAt > now));
+      setImpacts((items) => items.filter((impact) => now - impact.time < 700));
+      setDashTrails((items) => items.filter((trail) => now - trail.time < 460));
+      setHitFlashUntil((items) => {
+        const activeEntries = Object.entries(items).filter(([, until]) => until > now);
+        return activeEntries.length === Object.keys(items).length ? items : Object.fromEntries(activeEntries);
+      });
       frame = requestAnimationFrame(step);
     };
 
     frame = requestAnimationFrame(step);
     return () => cancelAnimationFrame(frame);
-  }, [addImpact, addLog, damageLocalAgent, damageTrainingTarget, sendSignal]);
+  }, [
+    addDashTrail,
+    addImpact,
+    addLog,
+    collectUpgrade,
+    damageLocalAgent,
+    damageTrainingTarget,
+    flashAgent,
+    isHost,
+    roomStarted,
+    sendSignal,
+    spawnUpgrade,
+  ]);
 
   const onlineAgents = useMemo(() => {
     const remote = Object.values(remoteAgents).filter((remoteAgent) => Date.now() - remoteAgent.updatedAt < 5000);
@@ -471,6 +685,32 @@ function CharacterRoom({
     showToast("房间链接已复制。");
   }
 
+  function startRoom() {
+    if (!isHost) {
+      addLog("等待房主开始行动。");
+      return;
+    }
+    if (!canStartRoom) {
+      addLog("至少需要 2 名玩家才能开始。");
+      return;
+    }
+    const now = Date.now();
+    setRoomStarted(true);
+    setStartedAt(now);
+    setCaptureProgress(0);
+    setShots([]);
+    setImpacts([]);
+    setDashTrails([]);
+    setUpgrades([]);
+    setWeaponLevel(0);
+    collectedUpgradeIdsRef.current.clear();
+    dashStateRef.current = null;
+    roomStartedRef.current = true;
+    lastUpgradeSpawnAtRef.current = now;
+    addLog("行动开始。");
+    sendSignal({ type: "room-start", startedBy: session.localPlayer.id, startedAt: now });
+  }
+
   function updatePointer(event: React.PointerEvent<HTMLDivElement>) {
     const rect = event.currentTarget.getBoundingClientRect();
     pointerRef.current = {
@@ -480,35 +720,75 @@ function CharacterRoom({
   }
 
   function fire() {
+    if (!roomStartedRef.current) return;
     const shooter = agentRef.current;
-    if (shooter.energy < FIRE_COST || shooter.hp <= 0) return;
-    const shot = createProjectile(shooter, createClientId(), Date.now());
+    const profile = getCharacterProfile(shooter.color);
+    const energyCost = FIRE_COST * profile.stats.fireCost;
+    if (shooter.energy < energyCost || shooter.hp <= 0) {
+      warnEnergy();
+      return;
+    }
+    const now = Date.now();
+    const shotCount = Math.min(1 + profile.stats.extraProjectiles + weaponLevelRef.current, 1 + MAX_WEAPON_UPGRADES + 1);
+    const spreadStep = shotCount <= 1 ? 0 : Math.min(0.22, 0.08 + shotCount * 0.018);
+    const shotsToFire = Array.from({ length: shotCount }, (_, index) => {
+      const offset = (index - (shotCount - 1) / 2) * spreadStep;
+      const isCenter = Math.abs(offset) < 0.001;
+      return createProjectile(shooter, createClientId(), now, {
+        angleOffset: offset,
+        damageMultiplier: isCenter ? 1 : 0.84,
+      });
+    });
 
     setAgent((previous) => ({
       ...previous,
-      energy: Math.max(0, previous.energy - FIRE_COST),
+      energy: Math.max(0, previous.energy - energyCost),
       action: "fire",
-      updatedAt: Date.now(),
+      updatedAt: now,
     }));
-    setShots((items) => [...items.slice(-14), shot]);
-    sendSignal({ type: "shot", shot });
-    addLog("脉冲弹道发射。");
+    setShots((items) => [...items.slice(-14), ...shotsToFire]);
+    for (const shot of shotsToFire) {
+      sendSignal({ type: "shot", shot });
+    }
+    addLog(shotCount > 1 ? `散射脉冲发射：${shotCount} 枚弹道。` : "脉冲弹道发射。");
   }
 
   function dash() {
+    if (!roomStartedRef.current) return;
     const current = agentRef.current;
-    if (current.energy < DASH_COST || current.hp <= 0) return;
-    setAgent((previous) =>
-      resolveAgentCollision({
-        ...previous,
-        x: previous.x + Math.cos(previous.angle) * DASH_DISTANCE,
-        y: previous.y + Math.sin(previous.angle) * DASH_DISTANCE,
-        energy: previous.energy - DASH_COST,
-        action: "dash",
-        updatedAt: Date.now(),
-      })
-    );
-    addLog("短距冲刺。");
+    if (current.energy < dashEnergyCost || current.hp <= 0 || dashStateRef.current) {
+      if (current.energy < dashEnergyCost) warnEnergy();
+      return;
+    }
+
+    const keys = keysRef.current;
+    let dx = 0;
+    let dy = 0;
+    if (keys.has("w") || keys.has("arrowup")) dy -= 1;
+    if (keys.has("s") || keys.has("arrowdown")) dy += 1;
+    if (keys.has("a") || keys.has("arrowleft")) dx -= 1;
+    if (keys.has("d") || keys.has("arrowright")) dx += 1;
+    const length = Math.hypot(dx, dy);
+    const directionX = length > 0 ? dx / length : Math.cos(current.angle);
+    const directionY = length > 0 ? dy / length : Math.sin(current.angle);
+    const profile = getCharacterProfile(current.color);
+    const now = Date.now();
+
+    dashStateRef.current = {
+      startedAt: now,
+      endsAt: now + DASH_DURATION_MS,
+      directionX,
+      directionY,
+      distance: DASH_DISTANCE * profile.stats.dashDistance,
+    };
+    setAgent((previous) => ({
+      ...previous,
+      energy: Math.max(0, previous.energy - dashEnergyCost),
+      action: "dash",
+      updatedAt: now,
+    }));
+    addDashTrail(current.x, current.y, current.x + directionX * 5, current.y + directionY * 5, current.color);
+    addLog("滑行启动。");
   }
 
   function resetLocalTest() {
@@ -519,6 +799,11 @@ function CharacterRoom({
     setCaptureProgress(0);
     setShots([]);
     setImpacts([]);
+    setDashTrails([]);
+    setUpgrades([]);
+    setWeaponLevel(0);
+    dashStateRef.current = null;
+    collectedUpgradeIdsRef.current.clear();
     addLog("本地测试状态已重置。");
   }
 
@@ -550,117 +835,173 @@ function CharacterRoom({
         <div className="system-banner">未找到 Supabase 配置，当前只能本机试玩。</div>
       ) : null}
 
-      <section className={`arena-layout ${SHOW_LOCAL_TEST_TOOLS ? "with-test-tools" : "public-arena-layout"}`}>
-        <section className="arena-card">
-          <div className="section-head">
-            <div>
-              <p>WASD / MOUSE</p>
-              <h2>行动场</h2>
-            </div>
-            {SHOW_LOCAL_TEST_TOOLS ? (
-              <button className="secondary-button" type="button" onClick={resetLocalTest}>
-                <RotateCcw aria-hidden="true" />
-                重置测试
-              </button>
-            ) : null}
-          </div>
-
-          <div
-            ref={arenaRef}
-            className={`character-arena ${isShaking ? "shake" : ""}`}
-            tabIndex={0}
-            onPointerMove={updatePointer}
-            onPointerDown={(event) => {
-              updatePointer(event);
-              if (event.button === 0) fire();
-              if (event.button === 2) dash();
-            }}
-            onContextMenu={(event) => event.preventDefault()}
-          >
-            {ARENA_ZONES.map((zone) => (
-              <div
-                key={zone.id}
-                className={`arena-zone ${zone.kind} ${zone.kind !== "core" ? "solid" : ""}`}
-                style={
-                  {
-                    "--x": `${zone.x}%`,
-                    "--y": `${zone.y}%`,
-                    "--r": `${zone.radius * 2}%`,
-                  } as CSSProperties
-                }
-              >
-                <span>{zone.label}</span>
+      {!roomStarted ? (
+        <RoomLobby
+          roomCode={session.roomCode}
+          localPlayerId={session.localPlayer.id}
+          hostId={hostId}
+          players={presencePlayers}
+          canStart={canStartRoom}
+          isHost={isHost}
+          onStart={startRoom}
+        />
+      ) : (
+        <section className="arena-layout with-rail">
+          <section className="arena-card">
+            <div className="section-head">
+              <div>
+                <p>WASD / MOUSE</p>
+                <h2>行动场</h2>
               </div>
-            ))}
+              {SHOW_LOCAL_TEST_TOOLS ? (
+                <button className="secondary-button" type="button" onClick={resetLocalTest}>
+                  <RotateCcw aria-hidden="true" />
+                  重置测试
+                </button>
+              ) : null}
+            </div>
 
-            {shots.map((shot) => {
-              const trailLength = Math.max(2.4, Math.hypot(shot.x - shot.previousX, shot.y - shot.previousY));
-              return (
-                <div key={shot.id} className="projectile-layer">
-                  <div
-                    className="projectile-trail"
-                    style={
-                      {
-                        "--x": `${shot.previousX}%`,
-                        "--y": `${shot.previousY}%`,
-                        "--angle": `${Math.atan2(shot.y - shot.previousY, shot.x - shot.previousX)}rad`,
-                        "--length": `${trailLength}%`,
-                      } as CSSProperties
-                    }
-                  />
-                  <div
-                    className="projectile"
-                    style={
-                      {
-                        "--x": `${shot.x}%`,
-                        "--y": `${shot.y}%`,
-                        "--angle": `${shot.angle}rad`,
-                      } as CSSProperties
-                    }
-                  />
+            <div
+              ref={arenaRef}
+              className={`character-arena ${isShaking ? "shake" : ""}`}
+              tabIndex={0}
+              onPointerMove={updatePointer}
+              onPointerDown={(event) => {
+                updatePointer(event);
+                if (event.button === 0) fire();
+                if (event.button === 2) dash();
+              }}
+              onContextMenu={(event) => event.preventDefault()}
+            >
+              {ARENA_ZONES.map((zone) => (
+                <div
+                  key={zone.id}
+                  className={`arena-zone ${zone.kind} ${zone.kind !== "core" ? "solid" : ""}`}
+                  style={
+                    {
+                      "--x": `${zone.x}%`,
+                      "--y": `${zone.y}%`,
+                      "--r": `${zone.radius * 2}%`,
+                    } as CSSProperties
+                  }
+                >
+                  <span>{zone.label}</span>
                 </div>
-              );
-            })}
+              ))}
 
-            {impacts.map((impact) => (
-              <div
-                key={impact.id}
-                className={`impact-effect ${impact.type}`}
-                style={{ "--x": `${impact.x}%`, "--y": `${impact.y}%` } as CSSProperties}
-              />
-            ))}
+              {dashTrails.map((trail) => {
+                const length = Math.max(2.4, Math.hypot(trail.x - trail.previousX, trail.y - trail.previousY));
+                return (
+                  <div
+                    key={trail.id}
+                    className="dash-trail"
+                    style={
+                      {
+                        "--x": `${trail.previousX}%`,
+                        "--y": `${trail.previousY}%`,
+                        "--angle": `${Math.atan2(trail.y - trail.previousY, trail.x - trail.previousX)}rad`,
+                        "--length": `${length}%`,
+                        "--trail-color": trail.color,
+                      } as CSSProperties
+                    }
+                  />
+                );
+              })}
 
-            {damageFlash ? <div className="damage-vignette" /> : null}
+              {upgrades.map((upgrade) => (
+                <div
+                  key={upgrade.id}
+                  className="upgrade-pickup"
+                  style={
+                    {
+                      "--x": `${upgrade.x}%`,
+                      "--y": `${upgrade.y}%`,
+                      "--r": `${UPGRADE_RADIUS * 2}%`,
+                    } as CSSProperties
+                  }
+                >
+                  <Zap aria-hidden="true" />
+                  <span>{upgrade.label}</span>
+                </div>
+              ))}
 
-            {onlineAgents.map((arenaAgent) => (
-              <AgentSprite key={arenaAgent.id} agent={arenaAgent} isLocal={arenaAgent.id === agent.id} />
-            ))}
-          </div>
-        </section>
+              {shots.map((shot) => {
+                const trailLength = Math.max(2.4, Math.hypot(shot.x - shot.previousX, shot.y - shot.previousY));
+                return (
+                  <div key={shot.id} className="projectile-layer">
+                    <div
+                      className="projectile-trail"
+                      style={
+                        {
+                          "--x": `${shot.previousX}%`,
+                          "--y": `${shot.previousY}%`,
+                          "--angle": `${Math.atan2(shot.y - shot.previousY, shot.x - shot.previousX)}rad`,
+                          "--length": `${trailLength}%`,
+                        } as CSSProperties
+                      }
+                    />
+                    <div
+                      className="projectile"
+                      style={
+                        {
+                          "--x": `${shot.x}%`,
+                          "--y": `${shot.y}%`,
+                          "--angle": `${shot.angle}rad`,
+                        } as CSSProperties
+                      }
+                    />
+                  </div>
+                );
+              })}
 
-        {SHOW_LOCAL_TEST_TOOLS ? (
-          <aside className="test-rail">
+              {impacts.map((impact) => (
+                <div
+                  key={impact.id}
+                  className={`impact-effect ${impact.type}`}
+                  style={{ "--x": `${impact.x}%`, "--y": `${impact.y}%` } as CSSProperties}
+                />
+              ))}
+
+              {damageFlash ? <div className="damage-vignette" /> : null}
+
+              {onlineAgents.map((arenaAgent) => (
+                <AgentSprite
+                  key={arenaAgent.id}
+                  agent={arenaAgent}
+                  isLocal={arenaAgent.id === agent.id}
+                  isFlashing={Boolean(hitFlashUntil[arenaAgent.id])}
+                />
+              ))}
+            </div>
+          </section>
+
+          <aside className="game-rail">
             <section className="panel">
               <div className="section-head compact">
                 <div>
-                  <p>LIVE TEST</p>
-                  <h2>实时测试</h2>
+                  <p>STATUS</p>
+                  <h2>你的状态</h2>
                 </div>
-                <Activity aria-hidden="true" />
+                <Gauge aria-hidden="true" />
               </div>
+              <PlayerHud
+                agent={agent}
+                weaponLevel={weaponLevel}
+                fireCost={fireEnergyCost}
+                dashCost={dashEnergyCost}
+                captureProgress={captureProgress}
+              />
+            </section>
 
-              <div className="meter-list">
-                <Meter label="生命" value={agent.hp} tone="red" />
-                <Meter label="能量" value={agent.energy} tone="green" />
-                <Meter label="核心上传" value={captureProgress} tone="amber" />
+            <section className="panel">
+              <div className="section-head compact">
+                <div>
+                  <p>ROOM</p>
+                  <h2>房间信息</h2>
+                </div>
+                <MousePointer2 aria-hidden="true" />
               </div>
-
-              <div className="diagnostic-grid">
-                <Diagnostic icon={<Gauge aria-hidden="true" />} label="坐标" value={`${agent.x.toFixed(1)}, ${agent.y.toFixed(1)}`} />
-                <Diagnostic icon={<Crosshair aria-hidden="true" />} label="朝向" value={`${Math.round((agent.angle * 180) / Math.PI)}°`} />
-                <Diagnostic icon={<Target aria-hidden="true" />} label="得分" value={String(agent.score)} />
-                <Diagnostic icon={<Users aria-hidden="true" />} label="在线" value={String(presencePlayers.length)} />
-              </div>
+              <RoomSummary roomCode={session.roomCode} startedAt={startedAt} hostId={hostId} players={presencePlayers} localPlayerId={agent.id} />
             </section>
 
             <section className="panel">
@@ -678,37 +1019,32 @@ function CharacterRoom({
                 <span>鼠标移动</span>
                 <b>瞄准</b>
                 <span>左键 / 空格</span>
-                <b>脉冲射击</b>
+                <b>射击</b>
                 <span>Shift / 右键</span>
-                <b>冲刺</b>
-                <span>E + 核心范围</span>
-                <b>上传核心</b>
-              </div>
-
-              <div className="pressed-keys">
-                {pressedKeys.length ? pressedKeys.map((key) => <kbd key={key}>{key.toUpperCase()}</kbd>) : <span>等待输入</span>}
+                <b>滑行</b>
+                <span>中央信标</span>
+                <b>每秒回血 20</b>
               </div>
             </section>
 
-            <section className="panel">
-              <div className="section-head compact">
-                <div>
-                  <p>ROOM</p>
-                  <h2>玩家</h2>
-                </div>
-                <MousePointer2 aria-hidden="true" />
-              </div>
-
-              <div className="arena-player-list">
-                {presencePlayers.map((player) => (
-                  <div key={player.id} className={player.id === agent.id ? "current" : ""}>
-                    <i style={{ "--player-color": player.color } as CSSProperties} />
-                    <span>{player.name}</span>
-                    <b>{player.codename}</b>
+            {SHOW_LOCAL_TEST_TOOLS ? (
+              <section className="panel">
+                <div className="section-head compact">
+                  <div>
+                    <p>LIVE TEST</p>
+                    <h2>实时测试</h2>
                   </div>
-                ))}
-              </div>
-            </section>
+                  <Activity aria-hidden="true" />
+                </div>
+
+                <div className="diagnostic-grid">
+                  <Diagnostic icon={<Crosshair aria-hidden="true" />} label="坐标" value={`${agent.x.toFixed(1)}, ${agent.y.toFixed(1)}`} />
+                  <Diagnostic icon={<Target aria-hidden="true" />} label="朝向" value={`${Math.round((agent.angle * 180) / Math.PI)}°`} />
+                  <Diagnostic icon={<Users aria-hidden="true" />} label="在线" value={String(presencePlayers.length)} />
+                  <Diagnostic icon={<Zap aria-hidden="true" />} label="按键" value={pressedKeys.join(" ").toUpperCase() || "等待输入"} />
+                </div>
+              </section>
+            ) : null}
 
             <section className="panel">
               <div className="section-head compact">
@@ -728,9 +1064,177 @@ function CharacterRoom({
               </div>
             </section>
           </aside>
-        ) : null}
-      </section>
+        </section>
+      )}
     </main>
+  );
+}
+
+function RoomLobby({
+  roomCode,
+  localPlayerId,
+  hostId,
+  players,
+  canStart,
+  isHost,
+  onStart,
+}: {
+  roomCode: string;
+  localPlayerId: string;
+  hostId: string;
+  players: PresencePlayer[];
+  canStart: boolean;
+  isHost: boolean;
+  onStart: () => void;
+}) {
+  return (
+    <section className="room-lobby">
+      <section className="panel lobby-main">
+        <div className="section-head">
+          <div>
+            <p>ROOM {roomCode}</p>
+            <h2>等待行动开始</h2>
+          </div>
+          <span className={canStart ? "ready-pill ready" : "ready-pill"}>{players.length}/4 在线</span>
+        </div>
+
+        <div className="lobby-info-grid">
+          <div>
+            <span>房主</span>
+            <b>{formatShortId(hostId)}</b>
+          </div>
+          <div>
+            <span>你的 ID</span>
+            <b>{formatShortId(localPlayerId)}</b>
+          </div>
+          <div>
+            <span>开始条件</span>
+            <b>{canStart ? "已满足" : "至少 2 人"}</b>
+          </div>
+        </div>
+
+        <button className="primary-button full-button" type="button" disabled={!isHost || !canStart} onClick={onStart}>
+          <Play aria-hidden="true" />
+          {isHost ? "开始行动" : "等待房主开始"}
+        </button>
+      </section>
+
+      <section className="panel lobby-roster-panel">
+        <div className="section-head compact">
+          <div>
+            <p>PLAYERS</p>
+            <h2>房间玩家</h2>
+          </div>
+          <Users aria-hidden="true" />
+        </div>
+        <PlayerRoster players={players} localPlayerId={localPlayerId} hostId={hostId} />
+      </section>
+    </section>
+  );
+}
+
+function PlayerHud({
+  agent,
+  weaponLevel,
+  fireCost,
+  dashCost,
+  captureProgress,
+}: {
+  agent: ArenaAgent;
+  weaponLevel: number;
+  fireCost: number;
+  dashCost: number;
+  captureProgress: number;
+}) {
+  const profile = getCharacterProfile(agent.color);
+  return (
+    <div className="player-hud">
+      <div className="hud-identity">
+        <i style={{ "--player-color": agent.color } as CSSProperties} />
+        <div>
+          <strong>{agent.name}</strong>
+          <span>{profile.name} / {profile.traitTitle}</span>
+        </div>
+      </div>
+
+      <HudMeter label="生命" value={agent.hp} max={profile.stats.maxHp} tone="red" />
+      <HudMeter label="共用能量" value={agent.energy} max={100} tone={agent.energy >= Math.min(fireCost, dashCost) ? "green" : "amber"} />
+      <HudMeter label="核心上传" value={captureProgress} max={100} tone="amber" />
+
+      <div className="hud-cost-grid">
+        <span>射击消耗 <b>{Math.ceil(fireCost)}</b></span>
+        <span>滑行消耗 <b>{Math.ceil(dashCost)}</b></span>
+        <span>弹道数量 <b>{1 + profile.stats.extraProjectiles + weaponLevel}</b></span>
+      </div>
+    </div>
+  );
+}
+
+function HudMeter({ label, value, max, tone }: { label: string; value: number; max: number; tone: "green" | "amber" | "red" }) {
+  return (
+    <div className={`hud-meter ${tone}`}>
+      <div>
+        <span>{label}</span>
+        <b>{Math.round(value)}</b>
+      </div>
+      <i>
+        <em style={{ width: `${Math.max(0, Math.min(100, (value / max) * 100))}%` }} />
+      </i>
+    </div>
+  );
+}
+
+function RoomSummary({
+  roomCode,
+  startedAt,
+  hostId,
+  players,
+  localPlayerId,
+}: {
+  roomCode: string;
+  startedAt: number | null;
+  hostId: string;
+  players: PresencePlayer[];
+  localPlayerId: string;
+}) {
+  return (
+    <div className="room-summary">
+      <div className="room-summary-grid">
+        <span>房间码 <b>{roomCode}</b></span>
+        <span>开始 <b>{startedAt ? formatClock(startedAt) : "等待"}</b></span>
+      </div>
+      <PlayerRoster players={players} localPlayerId={localPlayerId} hostId={hostId} compact />
+    </div>
+  );
+}
+
+function PlayerRoster({
+  players,
+  localPlayerId,
+  hostId,
+  compact = false,
+}: {
+  players: PresencePlayer[];
+  localPlayerId: string;
+  hostId: string;
+  compact?: boolean;
+}) {
+  return (
+    <div className={compact ? "arena-player-list compact" : "arena-player-list detailed"}>
+      {players.map((player) => {
+        const profile = getCharacterProfile(player.color);
+        return (
+          <div key={player.id} className={player.id === localPlayerId ? "current" : ""}>
+            <i style={{ "--player-color": player.color } as CSSProperties} />
+            <span>
+              {player.name}
+              <small>{formatShortId(player.id)} {player.id === hostId ? "房主" : "队员"}</small>
+            </span>
+            <b>{profile.name}</b>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -748,10 +1252,13 @@ function createTrainingTarget(now: number) {
   );
 }
 
-function AgentSprite({ agent, isLocal }: { agent: ArenaAgent; isLocal: boolean }) {
+function AgentSprite({ agent, isLocal, isFlashing }: { agent: ArenaAgent; isLocal: boolean; isFlashing: boolean }) {
+  const profile = getCharacterProfile(agent.color);
   return (
     <div
-      className={`agent-sprite ${isLocal ? "local" : ""} ${agent.action === "hit" ? "hit" : ""} ${agent.hp <= 0 ? "down" : ""}`}
+      className={`agent-sprite ${isLocal ? "local" : ""} ${agent.action === "hit" ? "hit" : ""} ${agent.action === "heal" ? "heal" : ""} ${
+        isFlashing ? "flashing" : ""
+      } ${agent.hp <= 0 ? "down" : ""}`}
       style={
         {
           "--x": `${agent.x}%`,
@@ -763,6 +1270,7 @@ function AgentSprite({ agent, isLocal }: { agent: ArenaAgent; isLocal: boolean }
       }
     >
       <span>{agent.codename}</span>
+      <em>{profile.traitTitle}</em>
       <i />
       <b>{Math.round(agent.hp)}</b>
     </div>
@@ -807,6 +1315,15 @@ function normalizeRoomCode(value: string) {
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "")
     .slice(0, 4);
+}
+
+function normalizeIndex(value: number, length: number) {
+  if (!Number.isFinite(value) || length <= 0) return 0;
+  return ((Math.trunc(value) % length) + length) % length;
+}
+
+function formatShortId(value: string) {
+  return value.length > 8 ? `${value.slice(0, 4)}...${value.slice(-4)}` : value;
 }
 
 function getRoomFromHash() {
