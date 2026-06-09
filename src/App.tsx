@@ -64,6 +64,7 @@ interface ImpactEffect {
 const STORAGE_NAME_KEY = "intel-clash:name";
 const STORAGE_COLOR_KEY = "intel-clash:color";
 const STORAGE_CODENAME_KEY = "intel-clash:codename";
+const SHOW_LOCAL_TEST_TOOLS = import.meta.env.DEV;
 
 export function App() {
   const initialRoom = getRoomFromHash();
@@ -119,7 +120,7 @@ export function App() {
     <main className="entry-shell">
       <section className="entry-stage">
         <div className="brand-lockup">
-          <p>CHARACTER TEST ARENA</p>
+          <p>CHARACTER ARENA</p>
           <h1>情报暗战</h1>
         </div>
 
@@ -128,7 +129,7 @@ export function App() {
             <div className="panel-title">
               <RadioTower aria-hidden="true" />
               <div>
-                <h2>创建测试场</h2>
+                <h2>创建行动房间</h2>
                 <p>用键盘移动角色，用鼠标瞄准和行动，朋友可用房间码加入。</p>
               </div>
             </div>
@@ -233,19 +234,7 @@ function CharacterRoom({
   const [damageFlash, setDamageFlash] = useState(false);
   const [isShaking, setIsShaking] = useState(false);
   const [agent, setAgent] = useState(() => createArenaAgent(session.localPlayer, Date.now()));
-  const [bot, setBot] = useState(() =>
-    createArenaAgent(
-      {
-        id: "training-target",
-        name: "训练靶机",
-        color: "#f26d5b",
-        codename: "靶机",
-        joinedAt: Date.now(),
-      },
-      Date.now(),
-      1
-    )
-  );
+  const [bot, setBot] = useState<ArenaAgent | null>(() => (SHOW_LOCAL_TEST_TOOLS ? createTrainingTarget(Date.now()) : null));
 
   const agentRef = useRef(agent);
   const botRef = useRef(bot);
@@ -281,7 +270,9 @@ function CharacterRoom({
   }, [addImpact, addLog, triggerDamageFeedback]);
 
   const damageTrainingTarget = useCallback(() => {
+    if (!SHOW_LOCAL_TEST_TOOLS) return;
     setBot((previous) => {
+      if (!previous) return previous;
       const hp = Math.max(0, previous.hp - FIRE_DAMAGE);
       addImpact(previous.x, previous.y, "hit");
       if (hp <= 0) {
@@ -326,7 +317,7 @@ function CharacterRoom({
 
   useEffect(() => {
     arenaRef.current?.focus();
-    addLog("测试场已加载。WASD 移动，鼠标瞄准。");
+    addLog("行动场已加载。WASD 移动，鼠标瞄准。");
   }, [addLog]);
 
   useEffect(() => {
@@ -416,7 +407,8 @@ function CharacterRoom({
 
       setShots((items) => {
         const now = Date.now();
-        const targets = [agentRef.current, botRef.current, ...Object.values(remoteAgentsRef.current)];
+        const trainingTargets = SHOW_LOCAL_TEST_TOOLS && botRef.current ? [botRef.current] : [];
+        const targets = [agentRef.current, ...trainingTargets, ...Object.values(remoteAgentsRef.current)];
         const nextShots: ArenaShot[] = [];
 
         for (const shot of items) {
@@ -446,7 +438,7 @@ function CharacterRoom({
           if (target) {
             if (target.id === agentRef.current.id && resolvedShot.shooterId !== agentRef.current.id) {
               damageLocalAgent();
-            } else if (target.id === botRef.current.id) {
+            } else if (SHOW_LOCAL_TEST_TOOLS && target.id === botRef.current?.id) {
               damageTrainingTarget();
             } else {
               addImpact(target.x, target.y, "hit");
@@ -469,7 +461,7 @@ function CharacterRoom({
 
   const onlineAgents = useMemo(() => {
     const remote = Object.values(remoteAgents).filter((remoteAgent) => Date.now() - remoteAgent.updatedAt < 5000);
-    const target = bot.hp > 0 ? [bot] : [];
+    const target = SHOW_LOCAL_TEST_TOOLS && bot && bot.hp > 0 ? [bot] : [];
     return [agent, ...remote, ...target];
   }, [agent, bot, remoteAgents]);
 
@@ -520,9 +512,10 @@ function CharacterRoom({
   }
 
   function resetLocalTest() {
+    if (!SHOW_LOCAL_TEST_TOOLS) return;
     const now = Date.now();
     setAgent(createArenaAgent(session.localPlayer, now));
-    setBot(createArenaAgent(bot, now, 1));
+    setBot(createTrainingTarget(now));
     setCaptureProgress(0);
     setShots([]);
     setImpacts([]);
@@ -554,20 +547,22 @@ function CharacterRoom({
 
       {errorMessage ? <div className="system-banner">{errorMessage}</div> : null}
       {connectionStatus === "missing-config" ? (
-        <div className="system-banner">未找到 Supabase 配置，当前只能本地单人测试。</div>
+        <div className="system-banner">未找到 Supabase 配置，当前只能本机试玩。</div>
       ) : null}
 
-      <section className="arena-layout">
+      <section className={`arena-layout ${SHOW_LOCAL_TEST_TOOLS ? "with-test-tools" : "public-arena-layout"}`}>
         <section className="arena-card">
           <div className="section-head">
             <div>
               <p>WASD / MOUSE</p>
               <h2>行动场</h2>
             </div>
-            <button className="secondary-button" type="button" onClick={resetLocalTest}>
-              <RotateCcw aria-hidden="true" />
-              重置测试
-            </button>
+            {SHOW_LOCAL_TEST_TOOLS ? (
+              <button className="secondary-button" type="button" onClick={resetLocalTest}>
+                <RotateCcw aria-hidden="true" />
+                重置测试
+              </button>
+            ) : null}
           </div>
 
           <div
@@ -643,97 +638,113 @@ function CharacterRoom({
           </div>
         </section>
 
-        <aside className="test-rail">
-          <section className="panel">
-            <div className="section-head compact">
-              <div>
-                <p>LIVE TEST</p>
-                <h2>实时测试</h2>
-              </div>
-              <Activity aria-hidden="true" />
-            </div>
-
-            <div className="meter-list">
-              <Meter label="生命" value={agent.hp} tone="red" />
-              <Meter label="能量" value={agent.energy} tone="green" />
-              <Meter label="核心上传" value={captureProgress} tone="amber" />
-            </div>
-
-            <div className="diagnostic-grid">
-              <Diagnostic icon={<Gauge aria-hidden="true" />} label="坐标" value={`${agent.x.toFixed(1)}, ${agent.y.toFixed(1)}`} />
-              <Diagnostic icon={<Crosshair aria-hidden="true" />} label="朝向" value={`${Math.round((agent.angle * 180) / Math.PI)}°`} />
-              <Diagnostic icon={<Target aria-hidden="true" />} label="得分" value={String(agent.score)} />
-              <Diagnostic icon={<Users aria-hidden="true" />} label="在线" value={String(presencePlayers.length)} />
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="section-head compact">
-              <div>
-                <p>CONTROLS</p>
-                <h2>操控</h2>
-              </div>
-              <Keyboard aria-hidden="true" />
-            </div>
-
-            <div className="control-list">
-              <span>WASD / 方向键</span>
-              <b>移动</b>
-              <span>鼠标移动</span>
-              <b>瞄准</b>
-              <span>左键 / 空格</span>
-              <b>脉冲射击</b>
-              <span>Shift / 右键</span>
-              <b>冲刺</b>
-              <span>E + 核心范围</span>
-              <b>上传核心</b>
-            </div>
-
-            <div className="pressed-keys">
-              {pressedKeys.length ? pressedKeys.map((key) => <kbd key={key}>{key.toUpperCase()}</kbd>) : <span>等待输入</span>}
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="section-head compact">
-              <div>
-                <p>ROOM</p>
-                <h2>玩家</h2>
-              </div>
-              <MousePointer2 aria-hidden="true" />
-            </div>
-
-            <div className="arena-player-list">
-              {presencePlayers.map((player) => (
-                <div key={player.id} className={player.id === agent.id ? "current" : ""}>
-                  <i style={{ "--player-color": player.color } as CSSProperties} />
-                  <span>{player.name}</span>
-                  <b>{player.codename}</b>
+        {SHOW_LOCAL_TEST_TOOLS ? (
+          <aside className="test-rail">
+            <section className="panel">
+              <div className="section-head compact">
+                <div>
+                  <p>LIVE TEST</p>
+                  <h2>实时测试</h2>
                 </div>
-              ))}
-            </div>
-          </section>
-
-          <section className="panel">
-            <div className="section-head compact">
-              <div>
-                <p>EVENTS</p>
-                <h2>日志</h2>
+                <Activity aria-hidden="true" />
               </div>
-              <Shield aria-hidden="true" />
-            </div>
-            <div className="event-log">
-              {logs.map((entry) => (
-                <div key={entry.id} className="log-entry">
-                  <span>{formatClock(entry.time)}</span>
-                  <strong>{entry.text}</strong>
+
+              <div className="meter-list">
+                <Meter label="生命" value={agent.hp} tone="red" />
+                <Meter label="能量" value={agent.energy} tone="green" />
+                <Meter label="核心上传" value={captureProgress} tone="amber" />
+              </div>
+
+              <div className="diagnostic-grid">
+                <Diagnostic icon={<Gauge aria-hidden="true" />} label="坐标" value={`${agent.x.toFixed(1)}, ${agent.y.toFixed(1)}`} />
+                <Diagnostic icon={<Crosshair aria-hidden="true" />} label="朝向" value={`${Math.round((agent.angle * 180) / Math.PI)}°`} />
+                <Diagnostic icon={<Target aria-hidden="true" />} label="得分" value={String(agent.score)} />
+                <Diagnostic icon={<Users aria-hidden="true" />} label="在线" value={String(presencePlayers.length)} />
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="section-head compact">
+                <div>
+                  <p>CONTROLS</p>
+                  <h2>操控</h2>
                 </div>
-              ))}
-            </div>
-          </section>
-        </aside>
+                <Keyboard aria-hidden="true" />
+              </div>
+
+              <div className="control-list">
+                <span>WASD / 方向键</span>
+                <b>移动</b>
+                <span>鼠标移动</span>
+                <b>瞄准</b>
+                <span>左键 / 空格</span>
+                <b>脉冲射击</b>
+                <span>Shift / 右键</span>
+                <b>冲刺</b>
+                <span>E + 核心范围</span>
+                <b>上传核心</b>
+              </div>
+
+              <div className="pressed-keys">
+                {pressedKeys.length ? pressedKeys.map((key) => <kbd key={key}>{key.toUpperCase()}</kbd>) : <span>等待输入</span>}
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="section-head compact">
+                <div>
+                  <p>ROOM</p>
+                  <h2>玩家</h2>
+                </div>
+                <MousePointer2 aria-hidden="true" />
+              </div>
+
+              <div className="arena-player-list">
+                {presencePlayers.map((player) => (
+                  <div key={player.id} className={player.id === agent.id ? "current" : ""}>
+                    <i style={{ "--player-color": player.color } as CSSProperties} />
+                    <span>{player.name}</span>
+                    <b>{player.codename}</b>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="section-head compact">
+                <div>
+                  <p>EVENTS</p>
+                  <h2>日志</h2>
+                </div>
+                <Shield aria-hidden="true" />
+              </div>
+              <div className="event-log">
+                {logs.map((entry) => (
+                  <div key={entry.id} className="log-entry">
+                    <span>{formatClock(entry.time)}</span>
+                    <strong>{entry.text}</strong>
+                  </div>
+                ))}
+              </div>
+            </section>
+          </aside>
+        ) : null}
       </section>
     </main>
+  );
+}
+
+function createTrainingTarget(now: number) {
+  return createArenaAgent(
+    {
+      id: "training-target",
+      name: "训练靶机",
+      color: "#f26d5b",
+      codename: "靶机",
+      joinedAt: now,
+    },
+    now,
+    1
   );
 }
 
