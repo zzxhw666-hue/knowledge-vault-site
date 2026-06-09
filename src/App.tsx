@@ -1,43 +1,49 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
+  Activity,
   Copy,
   Crosshair,
+  Gauge,
+  Keyboard,
   LogIn,
+  MousePointer2,
   Play,
   RadioTower,
   RotateCcw,
   Shield,
-  Signal,
-  Swords,
-  Trophy,
+  Target,
   Users,
   Zap,
 } from "lucide-react";
 import {
-  CODENAMES,
-  CORE_HOLD_TO_WIN_MS,
-  MAP_LINKS,
-  MATCH_DURATION_MS,
-  MAX_PLAYERS,
-  MIN_PLAYERS_TO_START,
-  NODE_ORDER,
-  PLAYER_COLORS,
-} from "./game/config";
-import {
-  canInvestInNode,
-  eventMasksInvestments,
-  getEffectiveInvestment,
-  getPlayerNodeScore,
-  getResourceRate,
-  getWinnerCandidates,
-  isCoreOpen,
-} from "./game/rules";
-import type { GameState, MapNode, NodeId, Player, PresencePlayer } from "./game/types";
-import { useRealtimeRoom } from "./hooks/useRealtimeRoom";
+  AGENT_RADIUS,
+  ARENA_ZONES,
+  CAPTURE_SECONDS,
+  DASH_COST,
+  DASH_DISTANCE,
+  ENERGY_REGEN_PER_SECOND,
+  FIRE_COST,
+  FIRE_DAMAGE,
+  clampAgent,
+  createArenaAgent,
+  findShotTarget,
+  isInCore,
+  respawnAgent,
+} from "./game/arena";
+import type { ArenaAgent, ArenaSignal, ArenaShot } from "./game/arena";
+import { CODENAMES, PLAYER_COLORS } from "./game/config";
+import type { PresencePlayer } from "./game/types";
+import { useArenaRoom } from "./hooks/useArenaRoom";
 
 interface RoomSession {
   roomCode: string;
   localPlayer: PresencePlayer;
+}
+
+interface LogEntry {
+  id: string;
+  time: number;
+  text: string;
 }
 
 const STORAGE_NAME_KEY = "intel-clash:name";
@@ -83,7 +89,7 @@ export function App() {
 
   if (session) {
     return (
-      <GameRoom
+      <CharacterRoom
         session={session}
         onLeave={() => {
           window.location.hash = "";
@@ -98,7 +104,7 @@ export function App() {
     <main className="entry-shell">
       <section className="entry-stage">
         <div className="brand-lockup">
-          <p>INTEL CLASH</p>
+          <p>CHARACTER TEST ARENA</p>
           <h1>情报暗战</h1>
         </div>
 
@@ -107,8 +113,8 @@ export function App() {
             <div className="panel-title">
               <RadioTower aria-hidden="true" />
               <div>
-                <h2>开局</h2>
-                <p>2-4 人混战，实时投入资源争夺中央信标核心。</p>
+                <h2>创建测试场</h2>
+                <p>用键盘移动角色，用鼠标瞄准和行动，朋友可用房间码加入。</p>
               </div>
             </div>
 
@@ -123,7 +129,7 @@ export function App() {
             </label>
 
             <div className="field-group">
-              <span>阵营颜色</span>
+              <span>角色颜色</span>
               <div className="swatch-row">
                 {PLAYER_COLORS.map((color, index) => (
                   <button
@@ -149,20 +155,18 @@ export function App() {
               </select>
             </label>
 
-            <div className="button-row">
-              <button className="primary-button" type="button" onClick={() => beginRoom(generateRoomCode())}>
-                <Play aria-hidden="true" />
-                创建房间
-              </button>
-            </div>
+            <button className="primary-button" type="button" onClick={() => beginRoom(generateRoomCode())}>
+              <Play aria-hidden="true" />
+              创建房间
+            </button>
           </section>
 
           <section className="entry-panel compact-panel">
             <div className="panel-title">
               <LogIn aria-hidden="true" />
               <div>
-                <h2>加入</h2>
-                <p>输入朋友给你的 4 位房间码。</p>
+                <h2>加入朋友</h2>
+                <p>输入 4 位房间码，进入同一个行动场。</p>
               </div>
             </div>
 
@@ -193,7 +197,7 @@ export function App() {
   );
 }
 
-function GameRoom({
+function CharacterRoom({
   session,
   onLeave,
   showToast,
@@ -202,39 +206,182 @@ function GameRoom({
   onLeave: () => void;
   showToast: (message: string) => void;
 }) {
-  const { gameState, presencePlayers, connectionStatus, errorMessage, isHost, sendInvest, requestStart, requestReset } =
-    useRealtimeRoom({
-      roomCode: session.roomCode,
-      localPlayer: session.localPlayer,
-    });
-  const now = useClock(1000);
-  const [selectedNodeId, setSelectedNodeId] = useState<NodeId>("relay-north");
-  const [investAmount, setInvestAmount] = useState(5);
+  const arenaRef = useRef<HTMLDivElement | null>(null);
+  const keysRef = useRef(new Set<string>());
+  const pointerRef = useRef({ x: 50, y: 50 });
+  const lastBroadcastRef = useRef(0);
+  const [captureProgress, setCaptureProgress] = useState(0);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [pressedKeys, setPressedKeys] = useState<string[]>([]);
+  const [shots, setShots] = useState<ArenaShot[]>([]);
+  const [agent, setAgent] = useState(() => createArenaAgent(session.localPlayer, Date.now()));
+  const [bot, setBot] = useState(() =>
+    createArenaAgent(
+      {
+        id: "training-target",
+        name: "训练靶机",
+        color: "#f26d5b",
+        codename: "靶机",
+        joinedAt: Date.now(),
+      },
+      Date.now(),
+      1
+    )
+  );
 
-  const currentPlayer = gameState.players[session.localPlayer.id];
-  const selectedNode = gameState.nodes[selectedNodeId];
-  const onlinePlayers = presencePlayers.slice(0, MAX_PLAYERS);
-  const visiblePlayers = gameState.playerOrder.map((playerId) => gameState.players[playerId]).filter(Boolean);
-  const maskedInvestments = eventMasksInvestments(gameState, session.localPlayer.id);
-  const coreOpen = isCoreOpen(gameState, now);
-  const coreOwner = gameState.nodes.core.ownerId ? gameState.players[gameState.nodes.core.ownerId] : null;
-  const canStart =
-    isHost &&
-    gameState.phase !== "running" &&
-    connectionStatus !== "missing-config" &&
-    onlinePlayers.length >= MIN_PLAYERS_TO_START;
-  const canInvest =
-    gameState.phase === "running" &&
-    Boolean(currentPlayer) &&
-    canInvestInNode(gameState, selectedNodeId, now) &&
-    Math.floor(currentPlayer?.resources ?? 0) > 0;
-  const safeAmount = Math.min(Math.max(1, investAmount), Math.max(1, Math.floor(currentPlayer?.resources ?? 1)));
-  const winners = getWinnerCandidates(gameState);
+  const agentRef = useRef(agent);
+  const botRef = useRef(bot);
+  const remoteAgentsRef = useRef<Record<string, ArenaAgent>>({});
+
+  const addLog = useCallback((text: string) => {
+    setLogs((entries) => [{ id: createClientId(), time: Date.now(), text }, ...entries].slice(0, 8));
+  }, []);
+
+  const handleSignal = useCallback(
+    (signal: ArenaSignal) => {
+      if (signal.type === "shot") {
+        setShots((items) => [...items.slice(-6), signal.shot]);
+        if (signal.shot.targetId === session.localPlayer.id) {
+          setAgent((previous) => {
+            const hp = Math.max(0, previous.hp - FIRE_DAMAGE);
+            if (hp <= 0) {
+              addLog("你被命中，已重新部署。");
+              return respawnAgent({ ...previous, hp }, Date.now(), 0);
+            }
+            addLog("你被脉冲命中。");
+            return { ...previous, hp, action: "fire", updatedAt: Date.now() };
+          });
+        }
+        return;
+      }
+      if (signal.type === "score" && signal.playerId !== session.localPlayer.id) {
+        addLog("对手完成了一次核心上传。");
+      }
+    },
+    [addLog, session.localPlayer.id]
+  );
+
+  const { connectionStatus, errorMessage, presencePlayers, remoteAgents, sendSignal } = useArenaRoom({
+    roomCode: session.roomCode,
+    localPlayer: session.localPlayer,
+    onSignal: handleSignal,
+  });
 
   useEffect(() => {
-    if (!currentPlayer) return;
-    setInvestAmount((amount) => Math.min(Math.max(1, amount), Math.max(1, Math.floor(currentPlayer.resources))));
-  }, [currentPlayer?.resources]);
+    agentRef.current = agent;
+  }, [agent]);
+
+  useEffect(() => {
+    botRef.current = bot;
+  }, [bot]);
+
+  useEffect(() => {
+    remoteAgentsRef.current = remoteAgents;
+  }, [remoteAgents]);
+
+  useEffect(() => {
+    arenaRef.current?.focus();
+    addLog("测试场已加载。WASD 移动，鼠标瞄准。");
+  }, [addLog]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const key = normalizeKey(event.key);
+      if (!key) return;
+      event.preventDefault();
+      if (key === "space" && !event.repeat) fire();
+      if (key === "shift" && !event.repeat) dash();
+      keysRef.current.add(key);
+      setPressedKeys([...keysRef.current]);
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      const key = normalizeKey(event.key);
+      if (!key) return;
+      event.preventDefault();
+      keysRef.current.delete(key);
+      setPressedKeys([...keysRef.current]);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, []);
+
+  useEffect(() => {
+    let frame = 0;
+    let lastTime = performance.now();
+
+    const step = (time: number) => {
+      const elapsed = Math.min(0.05, Math.max(0, (time - lastTime) / 1000));
+      lastTime = time;
+      const keys = keysRef.current;
+
+      setAgent((previous) => {
+        let dx = 0;
+        let dy = 0;
+        if (keys.has("w") || keys.has("arrowup")) dy -= 1;
+        if (keys.has("s") || keys.has("arrowdown")) dy += 1;
+        if (keys.has("a") || keys.has("arrowleft")) dx -= 1;
+        if (keys.has("d") || keys.has("arrowright")) dx += 1;
+
+        const length = Math.hypot(dx, dy) || 1;
+        const pointer = pointerRef.current;
+        const angle = Math.atan2(pointer.y - previous.y, pointer.x - previous.x);
+        const isMoving = dx !== 0 || dy !== 0;
+        const isCapturing = keys.has("e") && isInCore(previous);
+        let score = previous.score;
+
+        if (isCapturing) {
+          setCaptureProgress((progress) => {
+            const next = Math.min(100, progress + (elapsed / CAPTURE_SECONDS) * 100);
+            if (next >= 100 && progress < 100) {
+              score += 1;
+              addLog("核心上传完成，得分 +1。");
+              sendSignal({ type: "score", playerId: previous.id, score, time: Date.now() });
+              return 0;
+            }
+            return next;
+          });
+        } else {
+          setCaptureProgress((progress) => Math.max(0, progress - elapsed * 18));
+        }
+
+        const next = clampAgent({
+          ...previous,
+          x: previous.x + (dx / length) * 28 * elapsed,
+          y: previous.y + (dy / length) * 28 * elapsed,
+          angle,
+          energy: Math.min(100, previous.energy + ENERGY_REGEN_PER_SECOND * elapsed),
+          score,
+          action: isCapturing ? "capture" : isMoving ? "move" : "idle",
+          updatedAt: Date.now(),
+        });
+
+        if (time - lastBroadcastRef.current > 80) {
+          lastBroadcastRef.current = time;
+          sendSignal({ type: "agent", agent: next });
+        }
+
+        return next;
+      });
+
+      setShots((items) => items.filter((shot) => Date.now() - shot.time < 180));
+      frame = requestAnimationFrame(step);
+    };
+
+    frame = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(frame);
+  }, [addLog, sendSignal]);
+
+  const onlineAgents = useMemo(() => {
+    const remote = Object.values(remoteAgents).filter((remoteAgent) => Date.now() - remoteAgent.updatedAt < 5000);
+    const target = bot.hp > 0 ? [bot] : [];
+    return [agent, ...remote, ...target];
+  }, [agent, bot, remoteAgents]);
 
   function copyRoom() {
     const url = `${window.location.origin}${window.location.pathname}#room=${session.roomCode}`;
@@ -242,15 +389,77 @@ function GameRoom({
     showToast("房间链接已复制。");
   }
 
-  function invest(amount: number) {
-    if (!canInvest || !currentPlayer) return;
-    sendInvest({
-      playerId: currentPlayer.id,
-      nodeId: selectedNodeId,
-      amount,
-      intentId: createClientId(),
-      sentAt: Date.now(),
-    });
+  function updatePointer(event: React.PointerEvent<HTMLDivElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    pointerRef.current = {
+      x: ((event.clientX - rect.left) / rect.width) * 100,
+      y: ((event.clientY - rect.top) / rect.height) * 100,
+    };
+  }
+
+  function fire() {
+    const shooter = agentRef.current;
+    if (shooter.energy < FIRE_COST || shooter.hp <= 0) return;
+    const remotes = Object.values(remoteAgentsRef.current);
+    const targets = [botRef.current, ...remotes].filter((target) => target.hp > 0);
+    const target = findShotTarget(shooter, targets);
+    const shot: ArenaShot = {
+      id: createClientId(),
+      shooterId: shooter.id,
+      targetId: target?.id ?? null,
+      x: shooter.x,
+      y: shooter.y,
+      angle: shooter.angle,
+      time: Date.now(),
+    };
+
+    setAgent((previous) => ({
+      ...previous,
+      energy: Math.max(0, previous.energy - FIRE_COST),
+      action: "fire",
+      updatedAt: Date.now(),
+    }));
+    setShots((items) => [...items.slice(-6), shot]);
+    sendSignal({ type: "shot", shot });
+
+    if (target?.id === botRef.current.id) {
+      setBot((previous) => {
+        const hp = Math.max(0, previous.hp - FIRE_DAMAGE);
+        if (hp <= 0) {
+          addLog("训练靶机被击倒，正在重置。");
+          window.setTimeout(() => setBot(respawnAgent(previous, Date.now(), 1)), 900);
+        }
+        return { ...previous, hp, action: "down", updatedAt: Date.now() };
+      });
+      return;
+    }
+
+    addLog(target ? "脉冲命中目标。" : "脉冲发射。");
+  }
+
+  function dash() {
+    const current = agentRef.current;
+    if (current.energy < DASH_COST || current.hp <= 0) return;
+    setAgent((previous) =>
+      clampAgent({
+        ...previous,
+        x: previous.x + Math.cos(previous.angle) * DASH_DISTANCE,
+        y: previous.y + Math.sin(previous.angle) * DASH_DISTANCE,
+        energy: previous.energy - DASH_COST,
+        action: "dash",
+        updatedAt: Date.now(),
+      })
+    );
+    addLog("短距冲刺。");
+  }
+
+  function resetLocalTest() {
+    const now = Date.now();
+    setAgent(createArenaAgent(session.localPlayer, now));
+    setBot(createArenaAgent(bot, now, 1));
+    setCaptureProgress(0);
+    setShots([]);
+    addLog("本地测试状态已重置。");
   }
 
   return (
@@ -259,7 +468,7 @@ function GameRoom({
         <div className="brand-inline">
           <RadioTower aria-hidden="true" />
           <div>
-            <p>INTEL CLASH</p>
+            <p>REALTIME CHARACTER ARENA</p>
             <h1>情报暗战</h1>
           </div>
         </div>
@@ -278,360 +487,207 @@ function GameRoom({
 
       {errorMessage ? <div className="system-banner">{errorMessage}</div> : null}
       {connectionStatus === "missing-config" ? (
-        <div className="system-banner">未找到 Supabase 配置，无法和朋友实时联机。</div>
+        <div className="system-banner">未找到 Supabase 配置，当前只能本地单人测试。</div>
       ) : null}
 
-      <section className="command-grid">
-        <section className="map-section">
+      <section className="arena-layout">
+        <section className="arena-card">
           <div className="section-head">
             <div>
-              <p>ROOM {session.roomCode}</p>
-              <h2>行动地图</h2>
+              <p>WASD / MOUSE</p>
+              <h2>行动场</h2>
             </div>
-            <RoundClock state={gameState} now={now} />
+            <button className="secondary-button" type="button" onClick={resetLocalTest}>
+              <RotateCcw aria-hidden="true" />
+              重置测试
+            </button>
           </div>
 
-          <IntelMap
-            state={gameState}
-            selectedNodeId={selectedNodeId}
-            maskedInvestments={maskedInvestments}
-            onSelect={setSelectedNodeId}
-          />
+          <div
+            ref={arenaRef}
+            className="character-arena"
+            tabIndex={0}
+            onPointerMove={updatePointer}
+            onPointerDown={(event) => {
+              updatePointer(event);
+              if (event.button === 0) fire();
+              if (event.button === 2) dash();
+            }}
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            {ARENA_ZONES.map((zone) => (
+              <div
+                key={zone.id}
+                className={`arena-zone ${zone.kind}`}
+                style={
+                  {
+                    "--x": `${zone.x}%`,
+                    "--y": `${zone.y}%`,
+                    "--r": `${zone.radius * 2}%`,
+                  } as CSSProperties
+                }
+              >
+                <span>{zone.label}</span>
+              </div>
+            ))}
+
+            {shots.map((shot) => (
+              <div
+                key={shot.id}
+                className="shot-beam"
+                style={
+                  {
+                    "--x": `${shot.x}%`,
+                    "--y": `${shot.y}%`,
+                    "--angle": `${shot.angle}rad`,
+                  } as CSSProperties
+                }
+              />
+            ))}
+
+            {onlineAgents.map((arenaAgent) => (
+              <AgentSprite key={arenaAgent.id} agent={arenaAgent} isLocal={arenaAgent.id === agent.id} />
+            ))}
+          </div>
         </section>
 
-        <aside className="side-rail">
+        <aside className="test-rail">
           <section className="panel">
             <div className="section-head compact">
               <div>
-                <p>{isHost ? "房主裁判" : "作战成员"}</p>
+                <p>LIVE TEST</p>
+                <h2>实时测试</h2>
+              </div>
+              <Activity aria-hidden="true" />
+            </div>
+
+            <div className="meter-list">
+              <Meter label="生命" value={agent.hp} tone="red" />
+              <Meter label="能量" value={agent.energy} tone="green" />
+              <Meter label="核心上传" value={captureProgress} tone="amber" />
+            </div>
+
+            <div className="diagnostic-grid">
+              <Diagnostic icon={<Gauge aria-hidden="true" />} label="坐标" value={`${agent.x.toFixed(1)}, ${agent.y.toFixed(1)}`} />
+              <Diagnostic icon={<Crosshair aria-hidden="true" />} label="朝向" value={`${Math.round((agent.angle * 180) / Math.PI)}°`} />
+              <Diagnostic icon={<Target aria-hidden="true" />} label="得分" value={String(agent.score)} />
+              <Diagnostic icon={<Users aria-hidden="true" />} label="在线" value={String(presencePlayers.length)} />
+            </div>
+          </section>
+
+          <section className="panel">
+            <div className="section-head compact">
+              <div>
+                <p>CONTROLS</p>
+                <h2>操控</h2>
+              </div>
+              <Keyboard aria-hidden="true" />
+            </div>
+
+            <div className="control-list">
+              <span>WASD / 方向键</span>
+              <b>移动</b>
+              <span>鼠标移动</span>
+              <b>瞄准</b>
+              <span>左键 / 空格</span>
+              <b>脉冲射击</b>
+              <span>Shift / 右键</span>
+              <b>冲刺</b>
+              <span>E + 核心范围</span>
+              <b>上传核心</b>
+            </div>
+
+            <div className="pressed-keys">
+              {pressedKeys.length ? pressedKeys.map((key) => <kbd key={key}>{key.toUpperCase()}</kbd>) : <span>等待输入</span>}
+            </div>
+          </section>
+
+          <section className="panel">
+            <div className="section-head compact">
+              <div>
+                <p>ROOM</p>
                 <h2>玩家</h2>
               </div>
-              <Users aria-hidden="true" />
+              <MousePointer2 aria-hidden="true" />
             </div>
 
-            <div className="player-list">
-              {(visiblePlayers.length ? visiblePlayers : onlinePlayers.map(toLobbyPlayer)).map((player) => (
-                <PlayerRow
-                  key={player.id}
-                  player={player}
-                  state={gameState}
-                  isLocal={player.id === session.localPlayer.id}
-                />
+            <div className="arena-player-list">
+              {presencePlayers.map((player) => (
+                <div key={player.id} className={player.id === agent.id ? "current" : ""}>
+                  <i style={{ "--player-color": player.color } as CSSProperties} />
+                  <span>{player.name}</span>
+                  <b>{player.codename}</b>
+                </div>
               ))}
             </div>
-
-            {gameState.phase === "lobby" ? (
-              <div className="lobby-actions">
-                <p>{onlinePlayers.length}/{MAX_PLAYERS} 人已进入。</p>
-                <button className="primary-button" type="button" disabled={!canStart} onClick={requestStart}>
-                  <Play aria-hidden="true" />
-                  开始行动
-                </button>
-              </div>
-            ) : null}
-
-            {gameState.phase === "finished" && isHost ? (
-              <button className="secondary-button full-button" type="button" onClick={requestReset}>
-                <RotateCcw aria-hidden="true" />
-                重开一局
-              </button>
-            ) : null}
           </section>
 
-          <section className="panel action-panel">
+          <section className="panel">
             <div className="section-head compact">
               <div>
-                <p>{selectedNode.kind === "core" ? (coreOpen ? "核心开放" : "核心锁定") : selectedNode.kind}</p>
-                <h2>{selectedNode.label}</h2>
+                <p>EVENTS</p>
+                <h2>日志</h2>
               </div>
-              {selectedNode.kind === "core" ? <Crosshair aria-hidden="true" /> : <Zap aria-hidden="true" />}
+              <Shield aria-hidden="true" />
             </div>
-
-            <p className="node-copy">{selectedNode.description}</p>
-            <NodeInvestmentList state={gameState} node={selectedNode} masked={maskedInvestments} />
-
-            <div className="invest-control">
-              <label>
-                投入情报点
-                <input
-                  type="range"
-                  min={1}
-                  max={Math.max(1, Math.floor(currentPlayer?.resources ?? 1))}
-                  value={safeAmount}
-                  disabled={!canInvest}
-                  onChange={(event) => setInvestAmount(Number(event.target.value))}
-                />
-              </label>
-
-              <div className="amount-row">
-                {[3, 8, 15].map((amount) => (
-                  <button
-                    key={amount}
-                    type="button"
-                    disabled={!canInvest}
-                    onClick={() => {
-                      setInvestAmount(amount);
-                      invest(amount);
-                    }}
-                  >
-                    {amount}
-                  </button>
-                ))}
-                <button
-                  type="button"
-                  disabled={!canInvest}
-                  onClick={() => {
-                    const allIn = Math.floor(currentPlayer?.resources ?? 0);
-                    setInvestAmount(allIn);
-                    invest(allIn);
-                  }}
-                >
-                  全压
-                </button>
-              </div>
-
-              <button className="primary-button full-button" type="button" disabled={!canInvest} onClick={() => invest(safeAmount)}>
-                <Zap aria-hidden="true" />
-                投入 {canInvest ? safeAmount : 0}
-              </button>
-            </div>
-          </section>
-
-          <section className="panel event-panel">
-            <div className="section-head compact">
-              <div>
-                <p>局势</p>
-                <h2>事件</h2>
-              </div>
-              <Signal aria-hidden="true" />
-            </div>
-
-            {gameState.activeEvent ? (
-              <div className="active-event">
-                <strong>{gameState.activeEvent.title}</strong>
-                <p>{gameState.activeEvent.description}</p>
-                <span>{formatMs(Math.max(0, gameState.activeEvent.endsAt - now))}</span>
-              </div>
-            ) : (
-              <div className="quiet-event">暂无事件</div>
-            )}
-
             <div className="event-log">
-              {gameState.eventLog.map((entry) => (
+              {logs.map((entry) => (
                 <div key={entry.id} className="log-entry">
                   <span>{formatClock(entry.time)}</span>
-                  <strong>{entry.title}</strong>
-                  <p>{entry.body}</p>
+                  <strong>{entry.text}</strong>
                 </div>
               ))}
             </div>
           </section>
         </aside>
       </section>
-
-      <CoreBar owner={coreOwner} state={gameState} now={now} />
-
-      {gameState.phase === "finished" ? (
-        <div className="endgame-backdrop">
-          <section className="endgame-panel">
-            <Trophy aria-hidden="true" />
-            <p>行动结束</p>
-            <h2>{gameState.winnerId ? `${gameState.players[gameState.winnerId]?.name} 控制了核心` : "无人完全掌控核心"}</h2>
-            <span>{gameState.finishReason}</span>
-            <div className="winner-list">
-              {winners.map((winner, index) => {
-                const player = gameState.players[winner.playerId];
-                return (
-                  <div key={winner.playerId}>
-                    <b>{index + 1}</b>
-                    <i style={{ "--player-color": player.color } as CSSProperties} />
-                    <span>{player.name}</span>
-                    <strong>{winner.score}</strong>
-                  </div>
-                );
-              })}
-            </div>
-            {isHost ? (
-              <button className="primary-button" type="button" onClick={requestReset}>
-                <RotateCcw aria-hidden="true" />
-                重开一局
-              </button>
-            ) : null}
-          </section>
-        </div>
-      ) : null}
     </main>
   );
 }
 
-function IntelMap({
-  state,
-  selectedNodeId,
-  maskedInvestments,
-  onSelect,
-}: {
-  state: GameState;
-  selectedNodeId: NodeId;
-  maskedInvestments: boolean;
-  onSelect: (nodeId: NodeId) => void;
-}) {
+function AgentSprite({ agent, isLocal }: { agent: ArenaAgent; isLocal: boolean }) {
   return (
-    <div className="intel-map">
-      <svg className="map-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-        {MAP_LINKS.map(([from, to]) => {
-          const a = state.nodes[from];
-          const b = state.nodes[to];
-          return <line key={`${from}-${to}`} x1={a.x} y1={a.y} x2={b.x} y2={b.y} />;
-        })}
-      </svg>
-
-      {NODE_ORDER.map((nodeId) => {
-        const node = state.nodes[nodeId];
-        const owner = node.ownerId ? state.players[node.ownerId] : null;
-        const total = Object.values(node.investments).reduce((sum, value) => sum + value, 0);
-        return (
-          <button
-            key={node.id}
-            type="button"
-            className={`map-node ${node.kind} ${selectedNodeId === node.id ? "selected" : ""} ${
-              owner ? "owned" : ""
-            }`}
-            style={
-              {
-                "--x": `${node.x}%`,
-                "--y": `${node.y}%`,
-                "--owner-color": owner?.color ?? "#f4efdf",
-              } as CSSProperties
-            }
-            onClick={() => onSelect(node.id)}
-          >
-            <span>{node.shortLabel}</span>
-            <b>{owner?.codename ?? "空白"}</b>
-            <i>{maskedInvestments && total > 0 ? "遮蔽" : Math.round(total)}</i>
-          </button>
-        );
-      })}
+    <div
+      className={`agent-sprite ${isLocal ? "local" : ""} ${agent.hp <= 0 ? "down" : ""}`}
+      style={
+        {
+          "--x": `${agent.x}%`,
+          "--y": `${agent.y}%`,
+          "--agent-color": agent.color,
+          "--angle": `${agent.angle}rad`,
+          "--size": `${AGENT_RADIUS * 2}%`,
+        } as CSSProperties
+      }
+    >
+      <span>{agent.codename}</span>
+      <i />
+      <b>{Math.round(agent.hp)}</b>
     </div>
   );
 }
 
-function PlayerRow({ player, state, isLocal }: { player: Player; state: GameState; isLocal: boolean }) {
-  const nodeScore = getPlayerNodeScore(state, player.id);
-  const corePercent = Math.min(100, (player.coreHoldMs / CORE_HOLD_TO_WIN_MS) * 100);
+function Meter({ label, value, tone }: { label: string; value: number; tone: "green" | "amber" | "red" }) {
   return (
-    <div className={`player-row ${isLocal ? "local" : ""}`}>
-      <i style={{ "--player-color": player.color } as CSSProperties} />
+    <div className={`test-meter ${tone}`}>
       <div>
-        <strong>{player.name}</strong>
-        <span>
-          {player.codename} · {player.online ? "在线" : "离线"}
-        </span>
-        <div className="mini-meter">
-          <b style={{ width: `${corePercent}%` }} />
-        </div>
+        <span>{label}</span>
+        <b>{Math.round(value)}</b>
       </div>
-      <aside>
-        <b>{Math.floor(player.resources)}</b>
-        <span>{nodeScore} 分</span>
-      </aside>
+      <i>
+        <em style={{ width: `${Math.max(0, Math.min(100, value))}%` }} />
+      </i>
     </div>
   );
 }
 
-function NodeInvestmentList({ state, node, masked }: { state: GameState; node: MapNode; masked: boolean }) {
-  const entries = Object.entries(node.investments)
-    .filter(([playerId]) => state.players[playerId])
-    .map(([playerId, amount]) => ({
-      player: state.players[playerId],
-      amount,
-      effective: getEffectiveInvestment(state, node, playerId),
-    }))
-    .sort((a, b) => b.effective - a.effective);
-
-  if (!entries.length) {
-    return <div className="empty-strip">无人投入</div>;
-  }
-
-  if (masked) {
-    return <div className="empty-strip">通信遮蔽中</div>;
-  }
-
+function Diagnostic({ icon, label, value }: { icon: ReactNode; label: string; value: string }) {
   return (
-    <div className="investment-list">
-      {entries.map(({ player, amount, effective }) => (
-        <div key={player.id}>
-          <i style={{ "--player-color": player.color } as CSSProperties} />
-          <span>{player.codename}</span>
-          <b>{Math.round(amount)}</b>
-          <small>{Math.round(effective)} 权重</small>
-        </div>
-      ))}
+    <div className="diagnostic">
+      {icon}
+      <span>{label}</span>
+      <b>{value}</b>
     </div>
   );
-}
-
-function RoundClock({ state, now }: { state: GameState; now: number }) {
-  if (state.phase === "lobby") {
-    return (
-      <div className="clock-pill">
-        <Shield aria-hidden="true" />
-        待命
-      </div>
-    );
-  }
-
-  if (state.phase === "finished") {
-    return (
-      <div className="clock-pill done">
-        <Trophy aria-hidden="true" />
-        结束
-      </div>
-    );
-  }
-
-  const matchRemaining = state.startedAt ? Math.max(0, MATCH_DURATION_MS - (now - state.startedAt)) : 0;
-  const coreRemaining = state.coreUnlockedAt ? Math.max(0, state.coreUnlockedAt - now) : 0;
-  return (
-    <div className="clock-stack">
-      <span>{formatMs(matchRemaining)}</span>
-      <b>{coreRemaining > 0 ? `核心锁定 ${formatMs(coreRemaining)}` : "核心开放"}</b>
-    </div>
-  );
-}
-
-function CoreBar({ owner, state, now }: { owner: Player | null; state: GameState; now: number }) {
-  const percent = owner ? Math.min(100, (owner.coreHoldMs / CORE_HOLD_TO_WIN_MS) * 100) : 0;
-  const coreOpen = isCoreOpen(state, now);
-  return (
-    <section className="core-bar">
-      <div>
-        <Swords aria-hidden="true" />
-        <span>{coreOpen ? (owner ? `${owner.codename} 正在控制核心` : "核心开放，无人控制") : "核心仍在锁定"}</span>
-      </div>
-      <div className="core-meter">
-        <b style={{ width: `${percent}%`, background: owner?.color ?? "#f4efdf" }} />
-      </div>
-      <strong>{owner ? `${Math.floor(owner.coreHoldMs / 1000)} / ${Math.floor(CORE_HOLD_TO_WIN_MS / 1000)}s` : "--"}</strong>
-    </section>
-  );
-}
-
-function toLobbyPlayer(player: PresencePlayer): Player {
-  return {
-    ...player,
-    resources: 0,
-    coreHoldMs: 0,
-    online: true,
-  };
-}
-
-function useClock(intervalMs: number) {
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), intervalMs);
-    return () => window.clearInterval(timer);
-  }, [intervalMs]);
-  return now;
 }
 
 function generateRoomCode() {
@@ -661,19 +717,20 @@ function createClientId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+function normalizeKey(key: string) {
+  const normalized = key.toLowerCase();
+  if (["w", "a", "s", "d", "e", " ", "shift", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(normalized)) {
+    return normalized === " " ? "space" : normalized;
+  }
+  return "";
+}
+
 function formatConnection(status: string) {
   if (status === "connected") return "已连接";
   if (status === "connecting") return "连接中";
-  if (status === "missing-config") return "未配置";
+  if (status === "missing-config") return "本地";
   if (status === "error") return "异常";
   return "待连接";
-}
-
-function formatMs(ms: number) {
-  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
 function formatClock(time: number) {
