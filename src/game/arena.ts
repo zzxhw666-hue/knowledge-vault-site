@@ -8,6 +8,9 @@ export interface ArenaAgent extends PresencePlayer {
   hp: number;
   energy: number;
   score: number;
+  kills: number;
+  deaths: number;
+  isOverdrive: boolean;
   action: "idle" | "move" | "fire" | "dash" | "capture" | "hit" | "heal" | "down";
   updatedAt: number;
 }
@@ -32,7 +35,7 @@ export interface ArenaUpgrade {
   id: string;
   x: number;
   y: number;
-  kind: "splitter";
+  kind: "splitter" | "medkit" | "battery" | "haste" | "guard";
   label: string;
   spawnedAt: number;
   expiresAt: number;
@@ -44,7 +47,10 @@ export type ArenaSignal =
   | { type: "score"; playerId: string; score: number; time: number }
   | { type: "room-start"; startedBy: string; startedAt: number }
   | { type: "upgrade-spawn"; upgrade: ArenaUpgrade }
-  | { type: "upgrade-collect"; upgradeId: string; playerId: string; time: number };
+  | { type: "upgrade-collect"; upgradeId: string; playerId: string; time: number }
+  | { type: "damage"; targetId: string; shooterId: string; shotId: string; damage: number; time: number }
+  | { type: "elimination"; killerId: string; targetId: string; time: number }
+  | { type: "game-over"; winnerId: string; time: number };
 
 export interface ArenaZone {
   id: string;
@@ -75,6 +81,8 @@ export const UPGRADE_LIFETIME_MS = 18_000;
 export const UPGRADE_RADIUS = 2.6;
 export const MAX_WEAPON_UPGRADES = 4;
 export const MIN_ARENA_PLAYERS_TO_START = 2;
+export const KILL_LIMIT = 20;
+export const OVERDRIVE_RADIUS_MULTIPLIER = 2.25;
 export const ENERGY_REGEN_PER_SECOND = 18;
 export const CAPTURE_RADIUS = 10;
 export const CAPTURE_SECONDS = 4.2;
@@ -102,6 +110,14 @@ const UPGRADE_SPAWN_POINTS = [
   { x: 58, y: 56 },
 ];
 
+const UPGRADE_KINDS: Array<Pick<ArenaUpgrade, "kind" | "label">> = [
+  { kind: "splitter", label: "+1 弹道" },
+  { kind: "medkit", label: "急救包" },
+  { kind: "battery", label: "能量包" },
+  { kind: "haste", label: "疾行包" },
+  { kind: "guard", label: "护盾包" },
+];
+
 export function createArenaAgent(player: PresencePlayer, now: number, offset = 0): ArenaAgent {
   const spawn = getSpawnPoint(offset);
   const profile = getCharacterProfile(player.color);
@@ -113,6 +129,9 @@ export function createArenaAgent(player: PresencePlayer, now: number, offset = 0
     hp: profile.stats.maxHp,
     energy: 100,
     score: 0,
+    kills: 0,
+    deaths: 0,
+    isOverdrive: false,
     action: "idle",
     updatedAt: now,
   };
@@ -276,12 +295,13 @@ export function isInCore(agent: Pick<ArenaAgent, "x" | "y">) {
 
 export function createUpgradeItem(id: string, now: number, sequence: number): ArenaUpgrade {
   const point = UPGRADE_SPAWN_POINTS[Math.abs(sequence) % UPGRADE_SPAWN_POINTS.length];
+  const upgrade = UPGRADE_KINDS[Math.abs(sequence) % UPGRADE_KINDS.length];
   return {
     id,
     x: point.x,
     y: point.y,
-    kind: "splitter",
-    label: "+1 弹道",
+    kind: upgrade.kind,
+    label: upgrade.label,
     spawnedAt: now,
     expiresAt: now + UPGRADE_LIFETIME_MS,
   };
@@ -300,6 +320,7 @@ export function respawnAgent(agent: ArenaAgent, now: number, offset = 0): ArenaA
     y: spawn.y,
     hp: profile.stats.maxHp,
     energy: 72,
+    isOverdrive: agent.isOverdrive,
     action: "idle",
     updatedAt: now,
   };

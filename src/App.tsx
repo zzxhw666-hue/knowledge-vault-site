@@ -24,9 +24,11 @@ import {
   DASH_DISTANCE,
   ENERGY_REGEN_PER_SECOND,
   FIRE_COST,
+  KILL_LIMIT,
   MAX_WEAPON_UPGRADES,
   MIN_ARENA_PLAYERS_TO_START,
   MOVE_SPEED,
+  OVERDRIVE_RADIUS_MULTIPLIER,
   PROJECTILE_RADIUS,
   UPGRADE_RADIUS,
   UPGRADE_SPAWN_INTERVAL_MS,
@@ -62,7 +64,7 @@ interface ImpactEffect {
   id: string;
   x: number;
   y: number;
-  type: "hit" | "bounce" | "spark" | "heal" | "upgrade";
+  type: "hit" | "bounce" | "spark" | "heal" | "upgrade" | "shield";
   time: number;
 }
 
@@ -89,6 +91,8 @@ const STORAGE_COLOR_KEY = "intel-clash:color";
 const STORAGE_CODENAME_KEY = "intel-clash:codename";
 const SHOW_LOCAL_TEST_TOOLS = import.meta.env.DEV;
 const DASH_DURATION_MS = 220;
+const HASTE_DURATION_MS = 8_000;
+const GUARD_DURATION_MS = 7_000;
 
 export function App() {
   const initialRoom = getRoomFromHash();
@@ -263,12 +267,20 @@ function CharacterRoom({
   const lastUpgradeSpawnAtRef = useRef(0);
   const upgradeSequenceRef = useRef(0);
   const collectedUpgradeIdsRef = useRef(new Set<string>());
+  const processedDamageIdsRef = useRef(new Set<string>());
+  const processedEliminationIdsRef = useRef(new Set<string>());
+  const executedTargetIdsRef = useRef(new Set<string>());
   const dashStateRef = useRef<DashState | null>(null);
   const roomStartedRef = useRef(false);
   const weaponLevelRef = useRef(0);
+  const overdriveRef = useRef(false);
+  const guardUntilRef = useRef(0);
+  const hasteUntilRef = useRef(0);
   const [captureProgress, setCaptureProgress] = useState(0);
   const [roomStarted, setRoomStarted] = useState(false);
   const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [gameFinished, setGameFinished] = useState(false);
+  const [winnerId, setWinnerId] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [pressedKeys, setPressedKeys] = useState<string[]>([]);
   const [shots, setShots] = useState<ArenaShot[]>([]);
@@ -277,6 +289,9 @@ function CharacterRoom({
   const [upgrades, setUpgrades] = useState<ArenaUpgrade[]>([]);
   const [weaponLevel, setWeaponLevel] = useState(0);
   const [hitFlashUntil, setHitFlashUntil] = useState<Record<string, number>>({});
+  const [overdriveEnabled, setOverdriveEnabled] = useState(false);
+  const [guardUntil, setGuardUntil] = useState(0);
+  const [hasteUntil, setHasteUntil] = useState(0);
   const [damageFlash, setDamageFlash] = useState(false);
   const [isShaking, setIsShaking] = useState(false);
   const [agent, setAgent] = useState(() => createArenaAgent(session.localPlayer, Date.now()));
@@ -286,6 +301,7 @@ function CharacterRoom({
   const botRef = useRef(bot);
   const remoteAgentsRef = useRef<Record<string, ArenaAgent>>({});
   const upgradesRef = useRef<ArenaUpgrade[]>([]);
+  const sendSignalRef = useRef<(signal: ArenaSignal) => void>(() => {});
 
   const addLog = useCallback((text: string) => {
     setLogs((entries) => [{ id: createClientId(), time: Date.now(), text }, ...entries].slice(0, 8));
@@ -320,18 +336,54 @@ function CharacterRoom({
     window.setTimeout(() => setIsShaking(false), 180);
   }, []);
 
-  const damageLocalAgent = useCallback((damage: number) => {
+  const finishGame = useCallback((nextWinnerId: string, time: number, broadcast = false) => {
+    setGameFinished(true);
+    setWinnerId(nextWinnerId);
+    if (broadcast) {
+      sendSignalRef.current({ type: "game-over", winnerId: nextWinnerId, time });
+    }
+  }, []);
+
+  const awardLocalKill = useCallback((time: number) => {
+    setAgent((previous) => {
+      const kills = previous.kills + 1;
+      const next = {
+        ...previous,
+        kills,
+        updatedAt: time,
+      };
+      sendSignalRef.current({ type: "agent", agent: next });
+      if (kills >= KILL_LIMIT) {
+        finishGame(previous.id, time, true);
+      }
+      return next;
+    });
+  }, [finishGame]);
+
+  const damageLocalAgent = useCallback((damage: number, shooterId: string, damageId: string) => {
+    if (processedDamageIdsRef.current.has(damageId)) return;
+    processedDamageIdsRef.current.add(damageId);
+    if (overdriveRef.current || Date.now() < guardUntilRef.current) {
+      addImpact(agentRef.current.x, agentRef.current.y, "shield");
+      return;
+    }
     triggerDamageFeedback();
     setAgent((previous) => {
       flashAgent(previous.id);
       const hp = Math.max(0, previous.hp - damage);
       addImpact(previous.x, previous.y, "hit");
       if (hp <= 0) {
-        addLog("你被命中，已重新部署。");
-        return respawnAgent({ ...previous, hp }, Date.now(), 0);
+        const now = Date.now();
+        const next = respawnAgent({ ...previous, hp, deaths: previous.deaths + 1 }, now, 0);
+        addLog("你被击倒，已重新部署。");
+        sendSignalRef.current({ type: "elimination", killerId: shooterId, targetId: previous.id, time: now });
+        sendSignalRef.current({ type: "agent", agent: next });
+        return next;
       }
       addLog("你被脉冲命中。");
-      return { ...previous, hp, action: "hit", updatedAt: Date.now() };
+      const next = { ...previous, hp, action: "hit" as const, updatedAt: Date.now() };
+      sendSignalRef.current({ type: "agent", agent: next });
+      return next;
     });
   }, [addImpact, addLog, flashAgent, triggerDamageFeedback]);
 
@@ -344,12 +396,13 @@ function CharacterRoom({
       addImpact(previous.x, previous.y, "hit");
       if (hp <= 0) {
         addLog("训练靶机被击倒，正在重置。");
+        awardLocalKill(Date.now());
         window.setTimeout(() => setBot(respawnAgent(previous, Date.now(), 1)), 900);
         return { ...previous, hp, action: "down", updatedAt: Date.now() };
       }
       return { ...previous, hp, action: "hit", updatedAt: Date.now() };
     });
-  }, [addImpact, addLog, flashAgent]);
+  }, [addImpact, addLog, awardLocalKill, flashAgent]);
 
   const handleSignal = useCallback(
     (signal: ArenaSignal) => {
@@ -357,6 +410,22 @@ function CharacterRoom({
         const wasStarted = roomStartedRef.current;
         setRoomStarted(true);
         setStartedAt(signal.startedAt);
+        if (!wasStarted) {
+          setGameFinished(false);
+          setWinnerId(null);
+          setCaptureProgress(0);
+          setWeaponLevel(0);
+          setGuardUntil(0);
+          setHasteUntil(0);
+          setOverdriveEnabled(false);
+          processedDamageIdsRef.current.clear();
+          processedEliminationIdsRef.current.clear();
+          collectedUpgradeIdsRef.current.clear();
+          guardUntilRef.current = 0;
+          hasteUntilRef.current = 0;
+          overdriveRef.current = false;
+          setAgent((previous) => createArenaAgent(previous, signal.startedAt));
+        }
         roomStartedRef.current = true;
         lastUpgradeSpawnAtRef.current = signal.startedAt;
         if (!wasStarted) {
@@ -382,14 +451,39 @@ function CharacterRoom({
         }
         return;
       }
+      if (signal.type === "damage") {
+        if (signal.targetId === session.localPlayer.id) {
+          damageLocalAgent(signal.damage, signal.shooterId, signal.shotId);
+        }
+        return;
+      }
+      if (signal.type === "elimination") {
+        const eliminationId = `${signal.killerId}:${signal.targetId}:${signal.time}`;
+        if (processedEliminationIdsRef.current.has(eliminationId)) return;
+        processedEliminationIdsRef.current.add(eliminationId);
+        if (signal.killerId === session.localPlayer.id) {
+          awardLocalKill(signal.time);
+          addLog("击杀确认。");
+        } else if (signal.targetId === session.localPlayer.id) {
+          addLog("你被击杀。");
+        } else {
+          addLog("场上发生一次击杀。");
+        }
+        return;
+      }
+      if (signal.type === "game-over") {
+        finishGame(signal.winnerId, signal.time);
+        addLog("击杀上限达成，行动结束。");
+        return;
+      }
       if (signal.type === "score" && signal.playerId !== session.localPlayer.id) {
         addLog("对手完成了一次核心上传。");
       }
     },
-    [addLog, session.localPlayer.id]
+    [addLog, awardLocalKill, damageLocalAgent, finishGame, session.localPlayer.id]
   );
 
-  const { connectionStatus, errorMessage, presencePlayers, remoteAgents, sendSignal } = useArenaRoom({
+  const { connectionStatus, errorMessage, presencePlayers, remoteAgents, sendSignal, patchRemoteAgent } = useArenaRoom({
     roomCode: session.roomCode,
     localPlayer: session.localPlayer,
     onSignal: handleSignal,
@@ -400,6 +494,10 @@ function CharacterRoom({
   const localProfile = getCharacterProfile(session.localPlayer.color);
   const fireEnergyCost = FIRE_COST * localProfile.stats.fireCost;
   const dashEnergyCost = DASH_COST;
+
+  useEffect(() => {
+    sendSignalRef.current = sendSignal;
+  }, [sendSignal]);
 
   useEffect(() => {
     agentRef.current = agent;
@@ -426,6 +524,18 @@ function CharacterRoom({
   }, [roomStarted]);
 
   useEffect(() => {
+    overdriveRef.current = overdriveEnabled;
+  }, [overdriveEnabled]);
+
+  useEffect(() => {
+    guardUntilRef.current = guardUntil;
+  }, [guardUntil]);
+
+  useEffect(() => {
+    hasteUntilRef.current = hasteUntil;
+  }, [hasteUntil]);
+
+  useEffect(() => {
     if (!isHost || !roomStarted || !startedAt) return;
     sendSignal({ type: "room-start", startedBy: session.localPlayer.id, startedAt });
     for (const upgrade of upgradesRef.current) {
@@ -449,12 +559,66 @@ function CharacterRoom({
       if (collectedUpgradeIdsRef.current.has(upgrade.id)) return;
       collectedUpgradeIdsRef.current.add(upgrade.id);
       setUpgrades((items) => items.filter((item) => item.id !== upgrade.id));
-      setWeaponLevel((level) => Math.min(MAX_WEAPON_UPGRADES, level + 1));
       addImpact(upgrade.x, upgrade.y, "upgrade");
-      addLog("弹道升级获取：每次射击 +1 枚子弹。");
+      if (upgrade.kind === "splitter") {
+        setWeaponLevel((level) => Math.min(MAX_WEAPON_UPGRADES, level + 1));
+        addLog("弹道升级获取：每次射击 +1 枚子弹。");
+      }
+      if (upgrade.kind === "medkit") {
+        setAgent((previous) => {
+          const profile = getCharacterProfile(previous.color);
+          const next = { ...previous, hp: Math.min(profile.stats.maxHp, previous.hp + 45), action: "heal" as const, updatedAt: Date.now() };
+          sendSignalRef.current({ type: "agent", agent: next });
+          return next;
+        });
+        addLog("急救包获取：生命恢复。");
+      }
+      if (upgrade.kind === "battery") {
+        setAgent((previous) => {
+          const next = { ...previous, energy: Math.min(100, previous.energy + 60), updatedAt: Date.now() };
+          sendSignalRef.current({ type: "agent", agent: next });
+          return next;
+        });
+        addLog("能量包获取：共用能量恢复。");
+      }
+      if (upgrade.kind === "haste") {
+        const until = Date.now() + HASTE_DURATION_MS;
+        setHasteUntil(until);
+        hasteUntilRef.current = until;
+        addLog("疾行包获取：移动速度短暂提升。");
+      }
+      if (upgrade.kind === "guard") {
+        const until = Date.now() + GUARD_DURATION_MS;
+        setGuardUntil(until);
+        guardUntilRef.current = until;
+        addImpact(upgrade.x, upgrade.y, "shield");
+        addLog("护盾包获取：短暂无敌。");
+      }
       sendSignal({ type: "upgrade-collect", upgradeId: upgrade.id, playerId: session.localPlayer.id, time: Date.now() });
     },
     [addImpact, addLog, sendSignal, session.localPlayer.id]
+  );
+
+  const damageRemoteAgent = useCallback(
+    (target: ArenaAgent, damage: number, damageId: string) => {
+      addImpact(target.x, target.y, "hit");
+      flashAgent(target.id);
+      patchRemoteAgent(target.id, (agent) => ({
+        ...agent,
+        hp: Math.max(0, agent.hp - damage),
+        action: "hit",
+        updatedAt: Date.now(),
+      }));
+      sendSignal({
+        type: "damage",
+        targetId: target.id,
+        shooterId: session.localPlayer.id,
+        shotId: damageId,
+        damage,
+        time: Date.now(),
+      });
+    },
+    [addImpact, flashAgent, patchRemoteAgent, sendSignal, session.localPlayer.id]
   );
 
   useEffect(() => {
@@ -464,6 +628,24 @@ function CharacterRoom({
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() === "m" && !event.repeat) {
+        event.preventDefault();
+        setOverdriveEnabled((enabled) => {
+          const nextEnabled = !enabled;
+          overdriveRef.current = nextEnabled;
+          setAgent((previous) => {
+            const next = {
+              ...previous,
+              isOverdrive: nextEnabled,
+              updatedAt: Date.now(),
+            };
+            sendSignalRef.current({ type: "agent", agent: next });
+            return next;
+          });
+          return nextEnabled;
+        });
+        return;
+      }
       const key = normalizeKey(event.key);
       if (!key) return;
       event.preventDefault();
@@ -490,7 +672,7 @@ function CharacterRoom({
   }, [dash, fire]);
 
   useEffect(() => {
-    if (!roomStarted) return;
+    if (!roomStarted || gameFinished) return;
     let frame = 0;
     let lastTime = performance.now();
 
@@ -500,6 +682,15 @@ function CharacterRoom({
       const now = Date.now();
       const keys = keysRef.current;
 
+      if (guardUntilRef.current && now >= guardUntilRef.current) {
+        guardUntilRef.current = 0;
+        setGuardUntil(0);
+      }
+      if (hasteUntilRef.current && now >= hasteUntilRef.current) {
+        hasteUntilRef.current = 0;
+        setHasteUntil(0);
+      }
+
       if (isHost && now - lastUpgradeSpawnAtRef.current >= UPGRADE_SPAWN_INTERVAL_MS) {
         lastUpgradeSpawnAtRef.current = now;
         spawnUpgrade(now);
@@ -507,6 +698,7 @@ function CharacterRoom({
 
       setAgent((previous) => {
         const profile = getCharacterProfile(previous.color);
+        const hasteMultiplier = hasteUntilRef.current > now ? 1.28 : 1;
         const pointer = pointerRef.current;
         const angle = Math.atan2(pointer.y - previous.y, pointer.x - previous.x);
         const activeDash = dashStateRef.current && now < dashStateRef.current.endsAt ? dashStateRef.current : null;
@@ -533,8 +725,8 @@ function CharacterRoom({
 
           const length = Math.hypot(dx, dy) || 1;
           isMoving = dx !== 0 || dy !== 0;
-          moveX = (dx / length) * MOVE_SPEED * profile.stats.moveSpeed * elapsed;
-          moveY = (dy / length) * MOVE_SPEED * profile.stats.moveSpeed * elapsed;
+          moveX = (dx / length) * MOVE_SPEED * profile.stats.moveSpeed * hasteMultiplier * elapsed;
+          moveY = (dy / length) * MOVE_SPEED * profile.stats.moveSpeed * hasteMultiplier * elapsed;
         }
 
         let score = previous.score;
@@ -627,9 +819,11 @@ function CharacterRoom({
           if (target) {
             flashAgent(target.id);
             if (target.id === agentRef.current.id && resolvedShot.shooterId !== agentRef.current.id) {
-              damageLocalAgent(resolvedShot.damage);
+              addImpact(target.x, target.y, "hit");
             } else if (SHOW_LOCAL_TEST_TOOLS && target.id === botRef.current?.id) {
               damageTrainingTarget(resolvedShot.damage);
+            } else if (resolvedShot.shooterId === agentRef.current.id && target.id !== agentRef.current.id) {
+              damageRemoteAgent(target, resolvedShot.damage, resolvedShot.id);
             } else {
               addImpact(target.x, target.y, "hit");
             }
@@ -645,6 +839,22 @@ function CharacterRoom({
       const pickup = upgradesRef.current.find((upgrade) => upgrade.expiresAt > now && isUpgradeCollectible(agentRef.current, upgrade));
       if (pickup) {
         collectUpgrade(pickup);
+      }
+
+      if (overdriveRef.current) {
+        const localAgent = agentRef.current;
+        const crushRadius = AGENT_RADIUS * OVERDRIVE_RADIUS_MULTIPLIER + AGENT_RADIUS;
+        for (const target of Object.values(remoteAgentsRef.current)) {
+          if (target.hp <= 0 || executedTargetIdsRef.current.has(target.id)) continue;
+          if (distance(localAgent, target) > crushRadius) continue;
+          executedTargetIdsRef.current.add(target.id);
+          window.setTimeout(() => executedTargetIdsRef.current.delete(target.id), 1400);
+          damageRemoteAgent(target, 9999, `overdrive:${localAgent.id}:${target.id}:${now}`);
+          addImpact(target.x, target.y, "hit");
+        }
+        if (SHOW_LOCAL_TEST_TOOLS && botRef.current && botRef.current.hp > 0 && distance(localAgent, botRef.current) <= crushRadius) {
+          damageTrainingTarget(9999);
+        }
       }
 
       setUpgrades((items) => items.filter((upgrade) => upgrade.expiresAt > now));
@@ -664,9 +874,11 @@ function CharacterRoom({
     addImpact,
     addLog,
     collectUpgrade,
+    damageRemoteAgent,
     damageLocalAgent,
     damageTrainingTarget,
     flashAgent,
+    gameFinished,
     isHost,
     roomStarted,
     sendSignal,
@@ -697,16 +909,27 @@ function CharacterRoom({
     const now = Date.now();
     setRoomStarted(true);
     setStartedAt(now);
+    setGameFinished(false);
+    setWinnerId(null);
     setCaptureProgress(0);
     setShots([]);
     setImpacts([]);
     setDashTrails([]);
     setUpgrades([]);
     setWeaponLevel(0);
+    setGuardUntil(0);
+    setHasteUntil(0);
+    setOverdriveEnabled(false);
     collectedUpgradeIdsRef.current.clear();
+    processedDamageIdsRef.current.clear();
+    processedEliminationIdsRef.current.clear();
     dashStateRef.current = null;
+    guardUntilRef.current = 0;
+    hasteUntilRef.current = 0;
+    overdriveRef.current = false;
     roomStartedRef.current = true;
     lastUpgradeSpawnAtRef.current = now;
+    setAgent((previous) => createArenaAgent(previous, now));
     addLog("行动开始。");
     sendSignal({ type: "room-start", startedBy: session.localPlayer.id, startedAt: now });
   }
@@ -720,7 +943,7 @@ function CharacterRoom({
   }
 
   function fire() {
-    if (!roomStartedRef.current) return;
+    if (!roomStartedRef.current || gameFinished) return;
     const shooter = agentRef.current;
     const profile = getCharacterProfile(shooter.color);
     const energyCost = FIRE_COST * profile.stats.fireCost;
@@ -754,7 +977,7 @@ function CharacterRoom({
   }
 
   function dash() {
-    if (!roomStartedRef.current) return;
+    if (!roomStartedRef.current || gameFinished) return;
     const current = agentRef.current;
     if (current.energy < dashEnergyCost || current.hp <= 0 || dashStateRef.current) {
       if (current.energy < dashEnergyCost) warnEnergy();
@@ -802,8 +1025,16 @@ function CharacterRoom({
     setDashTrails([]);
     setUpgrades([]);
     setWeaponLevel(0);
+    setGuardUntil(0);
+    setHasteUntil(0);
+    setOverdriveEnabled(false);
     dashStateRef.current = null;
+    guardUntilRef.current = 0;
+    hasteUntilRef.current = 0;
+    overdriveRef.current = false;
     collectedUpgradeIdsRef.current.clear();
+    processedDamageIdsRef.current.clear();
+    processedEliminationIdsRef.current.clear();
     addLog("本地测试状态已重置。");
   }
 
@@ -972,6 +1203,14 @@ function CharacterRoom({
                   isFlashing={Boolean(hitFlashUntil[arenaAgent.id])}
                 />
               ))}
+
+              {gameFinished ? (
+                <div className="arena-end-overlay">
+                  <Shield aria-hidden="true" />
+                  <strong>{winnerId === agent.id ? "你已达成 20 杀" : "行动结束"}</strong>
+                  <span>{winnerId ? `胜者 ${formatShortId(winnerId)}` : "击杀上限达成"}</span>
+                </div>
+              ) : null}
             </div>
           </section>
 
@@ -990,6 +1229,8 @@ function CharacterRoom({
                 fireCost={fireEnergyCost}
                 dashCost={dashEnergyCost}
                 captureProgress={captureProgress}
+                guardUntil={guardUntil}
+                hasteUntil={hasteUntil}
               />
             </section>
 
@@ -1002,6 +1243,17 @@ function CharacterRoom({
                 <MousePointer2 aria-hidden="true" />
               </div>
               <RoomSummary roomCode={session.roomCode} startedAt={startedAt} hostId={hostId} players={presencePlayers} localPlayerId={agent.id} />
+            </section>
+
+            <section className="panel">
+              <div className="section-head compact">
+                <div>
+                  <p>{KILL_LIMIT} KILLS</p>
+                  <h2>击杀榜</h2>
+                </div>
+                <Target aria-hidden="true" />
+              </div>
+              <KillBoard agents={onlineAgents} winnerId={winnerId} />
             </section>
 
             <section className="panel">
@@ -1139,14 +1391,23 @@ function PlayerHud({
   fireCost,
   dashCost,
   captureProgress,
+  guardUntil,
+  hasteUntil,
 }: {
   agent: ArenaAgent;
   weaponLevel: number;
   fireCost: number;
   dashCost: number;
   captureProgress: number;
+  guardUntil: number;
+  hasteUntil: number;
 }) {
   const profile = getCharacterProfile(agent.color);
+  const now = Date.now();
+  const activeSkills = [
+    guardUntil > now ? "护盾" : "",
+    hasteUntil > now ? "疾行" : "",
+  ].filter(Boolean);
   return (
     <div className="player-hud">
       <div className="hud-identity">
@@ -1162,9 +1423,12 @@ function PlayerHud({
       <HudMeter label="核心上传" value={captureProgress} max={100} tone="amber" />
 
       <div className="hud-cost-grid">
+        <span>击杀 <b>{agent.kills}/{KILL_LIMIT}</b></span>
+        <span>死亡 <b>{agent.deaths}</b></span>
         <span>射击消耗 <b>{Math.ceil(fireCost)}</b></span>
         <span>滑行消耗 <b>{Math.ceil(dashCost)}</b></span>
         <span>弹道数量 <b>{1 + profile.stats.extraProjectiles + weaponLevel}</b></span>
+        <span>技能 <b>{activeSkills.join(" / ") || "无"}</b></span>
       </div>
     </div>
   );
@@ -1204,6 +1468,28 @@ function RoomSummary({
         <span>开始 <b>{startedAt ? formatClock(startedAt) : "等待"}</b></span>
       </div>
       <PlayerRoster players={players} localPlayerId={localPlayerId} hostId={hostId} compact />
+    </div>
+  );
+}
+
+function KillBoard({ agents, winnerId }: { agents: ArenaAgent[]; winnerId: string | null }) {
+  const sortedAgents = [...agents].sort((a, b) => b.kills - a.kills || a.deaths - b.deaths || a.joinedAt - b.joinedAt);
+  return (
+    <div className="kill-board">
+      {sortedAgents.map((agent) => {
+        const profile = getCharacterProfile(agent.color);
+        return (
+          <div key={agent.id} className={winnerId === agent.id ? "winner" : ""}>
+            <i style={{ "--player-color": agent.color } as CSSProperties} />
+            <span>
+              {agent.name}
+              <small>{profile.name}</small>
+            </span>
+            <b>{agent.kills}</b>
+            <em>{agent.deaths}</em>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1256,16 +1542,16 @@ function AgentSprite({ agent, isLocal, isFlashing }: { agent: ArenaAgent; isLoca
   const profile = getCharacterProfile(agent.color);
   return (
     <div
-      className={`agent-sprite ${isLocal ? "local" : ""} ${agent.action === "hit" ? "hit" : ""} ${agent.action === "heal" ? "heal" : ""} ${
-        isFlashing ? "flashing" : ""
-      } ${agent.hp <= 0 ? "down" : ""}`}
+      className={`agent-sprite ${isLocal ? "local" : ""} ${agent.isOverdrive ? "overdrive" : ""} ${
+        agent.action === "hit" ? "hit" : ""
+      } ${agent.action === "heal" ? "heal" : ""} ${isFlashing ? "flashing" : ""} ${agent.hp <= 0 ? "down" : ""}`}
       style={
         {
           "--x": `${agent.x}%`,
           "--y": `${agent.y}%`,
           "--agent-color": agent.color,
           "--angle": `${agent.angle}rad`,
-          "--size": `${AGENT_RADIUS * 2}%`,
+          "--size": `${AGENT_RADIUS * 2 * (agent.isOverdrive ? OVERDRIVE_RADIUS_MULTIPLIER : 1)}%`,
         } as CSSProperties
       }
     >

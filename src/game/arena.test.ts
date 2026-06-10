@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CORE_HEAL_PER_SECOND,
+  KILL_LIMIT,
   createArenaAgent,
   createProjectile,
   createUpgradeItem,
@@ -68,5 +69,23 @@ describe("arena physics", () => {
 
   it("uses 20 hp per second as the core healing baseline", () => {
     expect(CORE_HEAL_PER_SECOND).toBe(20);
+  });
+
+  it("starts agents with kill and death counters", () => {
+    const agent = createArenaAgent(player, 1);
+
+    expect(agent.kills).toBe(0);
+    expect(agent.deaths).toBe(0);
+    expect(agent.isOverdrive).toBe(false);
+  });
+
+  it("cycles through several upgrade pack types", () => {
+    const kinds = new Set(Array.from({ length: 5 }, (_, index) => createUpgradeItem(`u${index}`, 1, index).kind));
+
+    expect(kinds).toEqual(new Set(["splitter", "medkit", "battery", "haste", "guard"]));
+  });
+
+  it("ends arena matches at twenty kills", () => {
+    expect(KILL_LIMIT).toBe(20);
   });
 });

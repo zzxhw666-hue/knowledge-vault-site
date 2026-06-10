@@ -78,6 +78,36 @@ export function useArenaRoom({ roomCode, localPlayer, onSignal }: UseArenaRoomAr
           }
           return;
         }
+        if (signal.type === "damage" && signal.targetId !== localPlayer.id) {
+          setRemoteAgents((agents) => patchAgent(agents, signal.targetId, (agent) => ({
+            ...agent,
+            hp: Math.max(0, agent.hp - signal.damage),
+            action: "hit",
+            updatedAt: signal.time,
+          })));
+        }
+        if (signal.type === "elimination") {
+          setRemoteAgents((agents) => {
+            let next = agents;
+            if (signal.targetId !== localPlayer.id) {
+              next = patchAgent(next, signal.targetId, (agent) => ({
+                ...agent,
+                hp: 0,
+                deaths: agent.deaths + 1,
+                action: "down",
+                updatedAt: signal.time,
+              }));
+            }
+            if (signal.killerId !== localPlayer.id) {
+              next = patchAgent(next, signal.killerId, (agent) => ({
+                ...agent,
+                kills: agent.kills + 1,
+                updatedAt: signal.time,
+              }));
+            }
+            return next;
+          });
+        }
         onSignalRef.current(signal);
       })
       .subscribe(async (status, error) => {
@@ -108,11 +138,29 @@ export function useArenaRoom({ roomCode, localPlayer, onSignal }: UseArenaRoomAr
     });
   }, []);
 
+  const patchRemoteAgent = useCallback((agentId: string, updater: (agent: ArenaAgent) => ArenaAgent) => {
+    setRemoteAgents((agents) => patchAgent(agents, agentId, updater));
+  }, []);
+
   return {
     connectionStatus,
     errorMessage,
     presencePlayers,
     remoteAgents,
     sendSignal,
+    patchRemoteAgent,
+  };
+}
+
+function patchAgent(
+  agents: Record<string, ArenaAgent>,
+  agentId: string,
+  updater: (agent: ArenaAgent) => ArenaAgent
+): Record<string, ArenaAgent> {
+  const agent = agents[agentId];
+  if (!agent) return agents;
+  return {
+    ...agents,
+    [agentId]: updater(agent),
   };
 }
