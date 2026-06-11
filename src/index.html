@@ -1,14 +1,24 @@
+<!--
+  应用 HTML 入口。
+  - supabase-config.js 在模块脚本加载前注入运行时配置到 window.KNOWLEDGE_VAULT_CONFIG
+  - main.tsx 作为 ES Module 加载，Vite 会处理 TypeScript 编译和 HMR
+-->
 <!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
+    <!-- 移动端视口适配 -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- 浏览器主题色（与页面背景色一致，减少闪烁） -->
     <meta name="theme-color" content="#161713" />
     <title>情报暗战</title>
+    <!-- 运行时配置注入脚本：将 Supabase 连接参数挂载到 window 对象 -->
     <script src="./supabase-config.js"></script>
   </head>
   <body>
+    <!-- React 应用挂载点 -->
     <div id="root"></div>
+    <!-- Vite 处理 TypeScript/JSX 编译和模块热替换 -->
     <script type="module" src="./main.tsx"></script>
   </body>
 </html>
